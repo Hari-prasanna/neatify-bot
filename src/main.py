@@ -140,6 +140,53 @@ async def get_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(status_text, parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Status error: {e}")
+# ... (Previous imports stay the same)
+
+async def log_to_db(level, message, script="main.py"):
+    """Saves logs directly to Supabase so you can monitor the bot from anywhere."""
+    try:
+        supabase = get_supabase_client()
+        supabase.table("sys_logs").insert({
+            "log_level": level,
+            "message": message,
+            "script_name": script
+        }).execute()
+    except Exception as e:
+        print(f"Failed to write to sys_logs: {e}")
+
+async def handle_volunteer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles when someone cleans out of turn."""
+    user_id = update.message.from_user.id
+    week_str = get_current_week()
+
+    try:
+        supabase = get_supabase_client()
+        # 1. Check if user exists
+        roomie_res = supabase.table("dim_roommates").select("*").eq("telegram_id", user_id).execute()
+        if not roomie_res.data:
+            await update.message.reply_text("❌ You aren't in the database!")
+            return
+        
+        roomie = roomie_res.data[0]
+
+        # 2. Log as a volunteer cleaning
+        # We assign them the 'Entire Home' task (Task ID 1) by default
+        supabase.table("fct_cleaning_logs").insert({
+            "roommate_id": roomie["roommate_id"],
+            "task_id": 1, 
+            "week_number": week_str,
+            "is_volunteer": True
+        }).execute()
+
+        await log_to_db("INFO", f"Volunteer cleaning logged by {roomie['name']}")
+        await update.message.reply_text(f"🌟 Legend! {roomie['name']} volunteered this week. The regular rotation remains the same!")
+
+    except Exception as e:
+        await log_to_db("ERROR", f"Volunteer command failed: {str(e)}")
+        await update.message.reply_text("🚨 Snag in the volunteer logic.")
+
+# --- Inside your main execution block, don't forget to add: ---
+# app.add_handler(CommandHandler("volunteer", handle_volunteer))
 
 # --- 4. MAIN EXECUTION ---
 
@@ -157,6 +204,7 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("vacation", set_vacation))
     app.add_handler(CommandHandler("back", set_back))
     app.add_handler(CommandHandler("status", get_status))
+    app.add_handler(CommandHandler("volunteer", handle_volunteer))
     
     logger.info("Roomie Bot is live and listening...")
     app.run_polling()
