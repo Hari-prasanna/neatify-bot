@@ -1,7 +1,0 @@
-python-telegram-bot[all]
-supabase
-httpx
-httpcore[asyncio]
-anyio
-sniffio
-cryptography
