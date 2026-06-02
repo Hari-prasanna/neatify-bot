@@ -1,0 +1,31 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  # These are the "Placeholder Slots"
+  TelegramToken:
+    Type: String
+  SupabaseUrl:
+    Type: String
+  SupabaseKey:
+    Type: String
+
+Resources:
+  RoommateBotFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.10
+      Environment:
+        Variables:
+          # This maps the Parameter to the Lambda's Environment Variable
+          TELEGRAM_TOKEN: !Ref TelegramToken
+          SUPABASE_URL: !Ref SupabaseUrl
+          SUPABASE_KEY: !Ref SupabaseKey
+      Events:
+        TelegramWebhook:
+          Type: HttpApi
+          Properties:
+            Path: /webhook
+            Method: POST
