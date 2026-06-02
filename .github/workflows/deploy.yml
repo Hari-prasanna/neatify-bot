@@ -3,7 +3,7 @@ name: Deploy to AWS Lambda
 on:
   push:
     branches:
-      - dev  # Runs every time you push to the main branch
+      - dev 
 
 jobs:
   deploy:
@@ -42,3 +42,14 @@ jobs:
               TelegramToken=${{ secrets.TELEGRAM_TOKEN }} \
               SupabaseUrl=${{ secrets.SUPABASE_URL }} \
               SupabaseKey=${{ secrets.SUPABASE_KEY }}
+
+      - name: Show Webhook URL
+        run: |
+          echo "-------------------------------------------------------"
+          echo "DEPLOYMENT COMPLETE!"
+          echo "Your New Telegram Webhook URL is:"
+          aws cloudformation describe-stacks \
+            --stack-name roommate-bot-stack \
+            --query "Stacks[0].Outputs[?OutputKey=='WebookApiUrl'].OutputValue" \
+            --output text
+          echo "-------------------------------------------------------"
