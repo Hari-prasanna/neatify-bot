@@ -16,6 +16,8 @@ Resources:
       CodeUri: src/
       Handler: lambda_function.lambda_handler
       Runtime: python3.10
+      Timeout: 30
+      MemorySize: 512
       Environment:
         Variables:
           TELEGRAM_TOKEN: !Ref TelegramToken
