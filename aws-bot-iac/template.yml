@@ -2,7 +2,6 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 
 Parameters:
-  # These are the "Placeholder Slots"
   TelegramToken:
     Type: String
   SupabaseUrl:
@@ -17,9 +16,10 @@ Resources:
       CodeUri: src/
       Handler: lambda_function.lambda_handler
       Runtime: python3.10
+      Timeout: 30
+      MemorySize: 512
       Environment:
         Variables:
-          # This maps the Parameter to the Lambda's Environment Variable
           TELEGRAM_TOKEN: !Ref TelegramToken
           SUPABASE_URL: !Ref SupabaseUrl
           SUPABASE_KEY: !Ref SupabaseKey
@@ -29,3 +29,7 @@ Resources:
           Properties:
             Path: /webhook
             Method: POST
+Outputs:
+  WebookApiUrl:
+    Description: "URL for the Telegram Webhook"
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/webhook"
