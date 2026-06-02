@@ -1,2 +1,7 @@
+python-telegram-bot[all]
 supabase
-requests
+httpx
+httpcore[asyncio]
+anyio
+sniffio
+cryptography
