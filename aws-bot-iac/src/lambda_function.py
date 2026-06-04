@@ -98,7 +98,7 @@ async def process_update(event):
                 "week_number": week_str,
                 "is_volunteer": True
             }).execute()
-            await bot.send_message(chat_id=chat_id, text=f"🌟 Hero Alert! {user_name} volunteered. Rotation stays the same!")
+            await bot.send_message(chat_id=chat_id, text=f"Hero Alert! {user_name} volunteered. Thank you for stepping up!")
         return
 
     # --- LOGIC: 'done' ---

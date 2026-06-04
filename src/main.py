@@ -24,13 +24,26 @@ load_dotenv()
 
 def get_supabase_client() -> Client:
     """Connects to the Supabase PostgreSQL database."""
-    url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_KEY")
-    return create_client(url, key)
+    return create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
 def get_current_week() -> str:
-    """Returns the current week (e.g., '2026-W22')."""
+    """Returns the current week (e.g., '2026-W23')."""
     return datetime.now().strftime("%Y-W%V")
+
+def get_last_cleaned_date(supabase, roommate_id):
+    """Fetch the most recent cleaning date using 'cleaned_at'."""
+    res = supabase.table("fct_cleaning_logs") \
+        .select("cleaned_at") \
+        .eq("roommate_id", roommate_id) \
+        .order("cleaned_at", desc=True) \
+        .limit(1) \
+        .execute()
+    
+    if res.data:
+        # Splitting the ISO timestamp to get the date part
+        raw_date = res.data[0]['cleaned_at'].split("T")[0]
+        return datetime.strptime(raw_date, "%Y-%m-%d").strftime("%d %b")
+    return "Never"
 
 # --- 3. COMMAND HANDLERS ---
 
@@ -40,32 +53,29 @@ async def handle_done_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_name = update.message.from_user.first_name
     week_str = get_current_week()
     
-    logger.info(f"Processing 'done' message from {user_name} ({user_id})")
-
     try:
         supabase = get_supabase_client()
-
-        # A. Identity Check
         roomie_res = supabase.table("dim_roommates").select("*").eq("telegram_id", user_id).execute()
+        
         if not roomie_res.data:
-            await update.message.reply_text("🚫 I don't recognize your ID. Ask the admin to add you to the database.")
+            await update.message.reply_text("🚫 Unrecognized ID. Please register with the admin.")
             return
 
         roomie = roomie_res.data[0]
         roomie_id = roomie["roommate_id"]
 
-        # B. Idempotency Check (Prevent double-logging)
-        existing_log = supabase.table("fct_cleaning_logs") \
+        # Check for duplicate logs in the same week
+        existing = supabase.table("fct_cleaning_logs") \
             .select("*") \
             .eq("roommate_id", roomie_id) \
             .eq("week_number", week_str) \
             .execute()
 
-        if existing_log.data:
-            await update.message.reply_text(f"✨ {roomie['name']}, you've already cleaned this week!")
+        if existing.data:
+            await update.message.reply_text(f"✨ {roomie['name']}, you already cleaned for {week_str}!")
             return
 
-        # C. Get Task & Log Fact
+        # Fetch current task
         config_res = supabase.table("rotation_config") \
             .select("*, dim_tasks(task_description)") \
             .eq("roommate_id", roomie_id) \
@@ -73,120 +83,144 @@ async def handle_done_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         task = config_res.data[0]
         
+        # Insert the log (Supabase will auto-fill 'cleaned_at')
         supabase.table("fct_cleaning_logs").insert({
-            "roommate_id": roomie_id,
-            "task_id": task["task_id"],
+            "roommate_id": roomie_id, 
+            "task_id": task["task_id"], 
             "week_number": week_str
         }).execute()
 
-        # D. Next Person Logic (The Relay Race)
-        current_order = task["sequence_order"]
+        # Relay Logic: Find next person
+        check_order = task["sequence_order"]
         next_person = None
-        check_order = current_order
-
         while not next_person:
-            check_order = (check_order % 5) + 1 # Loops 1-5
-            
+            check_order = (check_order % 5) + 1
             next_res = supabase.table("rotation_config") \
                 .select("*, dim_roommates(*)") \
                 .eq("sequence_order", check_order) \
                 .execute()
             
-            potential = next_res.data[0]["dim_roommates"]
-            
-            if not potential["is_on_vacation"]:
-                next_person = potential
+            p = next_res.data[0]["dim_roommates"]
+            if not p["is_on_vacation"]:
+                next_person = p
 
         await update.message.reply_text(
-            f"✅ Success! {roomie['name']} cleaned the {task['dim_tasks']['task_description']}.\n"
-            f"🔔 NEXT UP: {next_person['name']}, you are on deck for next week!"
+            f"✅ Success! {roomie['name']} cleaned: {task['dim_tasks']['task_description']}.\n"
+            f"🔔 NEXT: {next_person['name']} is up for next week!"
         )
 
     except Exception as e:
         logger.error(f"Error in handle_done: {e}")
-        await update.message.reply_text("🚨 Error saving to database. Check the logs.")
 
-async def set_vacation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sets the user status to 'On Vacation'."""
-    user_id = update.message.from_user.id
+async def handle_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Calculates who is on deck based on the last 'cleaned_at' record."""
     try:
         supabase = get_supabase_client()
-        supabase.table("dim_roommates").update({"is_on_vacation": True}).eq("telegram_id", user_id).execute()
-        await update.message.reply_text("🌴 Status: On Vacation. I'll skip you until you type /back.")
-    except Exception as e:
-        logger.error(f"Vacation error: {e}")
+        last_log = supabase.table("fct_cleaning_logs") \
+            .select("roommate_id") \
+            .eq("is_volunteer", False) \
+            .order("cleaned_at", desc=True) \
+            .limit(1).execute()
+        
+        if not last_log.data:
+            await update.message.reply_text("🤔 No history found. Start the rotation with 'done'!")
+            return
 
-async def set_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sets the user status to 'Active'."""
-    user_id = update.message.from_user.id
-    try:
-        supabase = get_supabase_client()
-        supabase.table("dim_roommates").update({"is_on_vacation": False}).eq("telegram_id", user_id).execute()
-        await update.message.reply_text("🏠 Welcome back! You are now back in the rotation.")
+        last_id = last_log.data[0]['roommate_id']
+        current_order_res = supabase.table("rotation_config").select("sequence_order").eq("roommate_id", last_id).execute()
+        current_order = current_order_res.data[0]['sequence_order']
+
+        next_person = None
+        check_order = current_order
+        while not next_person:
+            check_order = (check_order % 5) + 1
+            res = supabase.table("rotation_config") \
+                .select("*, dim_roommates(*), dim_tasks(*)") \
+                .eq("sequence_order", check_order) \
+                .execute()
+            
+            potential = res.data[0]
+            if not potential["dim_roommates"]["is_on_vacation"]:
+                next_person = potential
+
+        await update.message.reply_text(
+            f"📅 **Current Week:** `{get_current_week()}`\n"
+            f"🔔 **Upcoming:** {next_person['dim_roommates']['name']}\n"
+            f"🧹 **Task:** {next_person['dim_tasks']['task_description']}",
+            parse_mode='Markdown'
+        )
     except Exception as e:
-        logger.error(f"Back error: {e}")
+        logger.error(f"Error in handle_next: {e}")
 
 async def get_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Shows current cleaning status of all roommates (Observability)."""
+    """Observability: Shows status and last cleaned date for everyone."""
     try:
         supabase = get_supabase_client()
-        res = supabase.table("dim_roommates").select("name, is_on_vacation").execute()
+        res = supabase.table("dim_roommates").select("roommate_id, name, is_on_vacation").execute()
         
-        status_text = "📊 **Current Status:**\n"
+        status_text = "📊 **Roommate Status**\n\n"
         for r in res.data:
+            last_date = get_last_cleaned_date(supabase, r['roommate_id'])
             icon = "🌴" if r['is_on_vacation'] else "✅"
-            status_text += f"{icon} {r['name']}\n"
+            status_text += f"{icon} **{r['name']}**\n└ Last: `{last_date}`\n"
         
         await update.message.reply_text(status_text, parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Status error: {e}")
-# ... (Previous imports stay the same)
 
-async def log_to_db(level, message, script="main.py"):
-    """Saves logs directly to Supabase so you can monitor the bot from anywhere."""
+async def handle_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Audit: Shows the 3 most recent cleaning logs."""
     try:
         supabase = get_supabase_client()
-        supabase.table("sys_logs").insert({
-            "log_level": level,
-            "message": message,
-            "script_name": script
-        }).execute()
+        res = supabase.table("fct_cleaning_logs") \
+            .select("*, dim_roommates(name), dim_tasks(task_description)") \
+            .order("cleaned_at", desc=True) \
+            .limit(3) \
+            .execute()
+
+        if not res.data:
+            await update.message.reply_text("📭 No logs found.")
+            return
+
+        msg = "🕒 **Recent Activity:**\n"
+        for log in res.data:
+            date_fmt = datetime.strptime(log['cleaned_at'].split("T")[0], "%Y-%m-%d").strftime("%d %b")
+            msg += f"• `{date_fmt}`: {log['dim_roommates']['name']} ({log['dim_tasks']['task_description']})\n"
+        
+        await update.message.reply_text(msg, parse_mode='Markdown')
     except Exception as e:
-        print(f"Failed to write to sys_logs: {e}")
+        logger.error(f"Last error: {e}")
+
+async def set_vacation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    try:
+        get_supabase_client().table("dim_roommates").update({"is_on_vacation": True}).eq("telegram_id", user_id).execute()
+        await update.message.reply_text("🌴 Status updated: You're on vacation!")
+    except Exception as e:
+        logger.error(f"Vacation error: {e}")
+
+async def set_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    try:
+        get_supabase_client().table("dim_roommates").update({"is_on_vacation": False}).eq("telegram_id", user_id).execute()
+        await update.message.reply_text("🏠 Welcome back! You're in the rotation.")
+    except Exception as e:
+        logger.error(f"Back error: {e}")
 
 async def handle_volunteer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles when someone cleans out of turn."""
     user_id = update.message.from_user.id
-    week_str = get_current_week()
-
     try:
         supabase = get_supabase_client()
-        # 1. Check if user exists
-        roomie_res = supabase.table("dim_roommates").select("*").eq("telegram_id", user_id).execute()
-        if not roomie_res.data:
-            await update.message.reply_text("❌ You aren't in the database!")
-            return
-        
-        roomie = roomie_res.data[0]
-
-        # 2. Log as a volunteer cleaning
-        # We assign them the 'Entire Home' task (Task ID 1) by default
+        roomie = supabase.table("dim_roommates").select("*").eq("telegram_id", user_id).execute().data[0]
         supabase.table("fct_cleaning_logs").insert({
-            "roommate_id": roomie["roommate_id"],
+            "roommate_id": roomie["roommate_id"], 
             "task_id": 1, 
-            "week_number": week_str,
+            "week_number": get_current_week(), 
             "is_volunteer": True
         }).execute()
-
-        await log_to_db("INFO", f"Volunteer cleaning logged by {roomie['name']}")
-        await update.message.reply_text(f"🌟 Legend! {roomie['name']} volunteered this week. The regular rotation remains the same!")
-
+        await update.message.reply_text(f"🌟 {roomie['name']} just volunteered! Hero move.")
     except Exception as e:
-        await log_to_db("ERROR", f"Volunteer command failed: {str(e)}")
-        await update.message.reply_text("🚨 Snag in the volunteer logic.")
-
-# --- Inside your main execution block, don't forget to add: ---
-# app.add_handler(CommandHandler("volunteer", handle_volunteer))
+        logger.error(f"Volunteer error: {e}")
 
 # --- 4. MAIN EXECUTION ---
 
@@ -196,15 +230,17 @@ if __name__ == '__main__':
 
     app = ApplicationBuilder().token(TOKEN).build()
     
-    # 1. Message Handlers
+    # Logic: Regex to trigger 'done' handler
     done_filter = filters.Chat(chat_id=GROUP_ID) & filters.Regex(r'(?i)done')
     app.add_handler(MessageHandler(done_filter, handle_done_command))
     
-    # 2. Command Handlers
+    # Command List
+    app.add_handler(CommandHandler("status", get_status))
+    app.add_handler(CommandHandler("next", handle_next))
+    app.add_handler(CommandHandler("last", handle_last))
     app.add_handler(CommandHandler("vacation", set_vacation))
     app.add_handler(CommandHandler("back", set_back))
-    app.add_handler(CommandHandler("status", get_status))
     app.add_handler(CommandHandler("volunteer", handle_volunteer))
     
-    logger.info("Roomie Bot is live and listening...")
+    logger.info("Roomie Bot (Local) is live...")
     app.run_polling()
