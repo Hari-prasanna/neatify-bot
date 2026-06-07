@@ -1,15 +1,15 @@
 import os
 import sys
 import logging
+import urllib.request
+import json
 from datetime import datetime
-import httpx
 from supabase import create_client, Client
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("reminder_script")
 
 def run_reminder():
-    # 1. Initialize Clients
     url = os.getenv("SUPABASE_URL")
     key = os.getenv("SUPABASE_KEY")
     token = os.getenv("TELEGRAM_TOKEN")
@@ -21,7 +21,7 @@ def run_reminder():
 
     supabase: Client = create_client(url, key)
 
-    # 2. Extract Last Cleaned Using Correct Schema
+    # Fetch last log using your corrected database schema column: cleaned_at
     last_log = supabase.table("fct_cleaning_logs") \
         .select("roommate_id") \
         .eq("is_volunteer", False) \
@@ -29,12 +29,10 @@ def run_reminder():
         .limit(1).execute()
     
     if not last_log.data:
-        logger.warning("No cleaning history found in fct_cleaning_logs. Cannot calculate next person.")
+        logger.warning("No history found in fct_cleaning_logs.")
         return
 
     last_id = last_log.data[0]['roommate_id']
-    
-    # 3. Process Sequence Relay
     current_order = supabase.table("rotation_config").select("sequence_order").eq("roommate_id", last_id).execute().data[0]['sequence_order']
 
     next_person = None
@@ -46,7 +44,6 @@ def run_reminder():
         if not potential["dim_roommates"]["is_on_vacation"]:
             next_person = potential
 
-    # 4. Construct Payload
     week_str = datetime.now().strftime("%Y-W%V")
     message = (
         f"🧹 **Friday Cleaning Reminder!** 🧹\n\n"
@@ -56,7 +53,7 @@ def run_reminder():
         f"Let's keep the house fresh! Please drop a 'done' message when finished."
     )
 
-    # 5. Push Direct to Telegram via Synchronous HTTP POST
+    # Using Python's built-in urllib to avoid adding extra dependencies to requirements.txt
     telegram_url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": int(group_id),
@@ -64,12 +61,22 @@ def run_reminder():
         "parse_mode": "Markdown"
     }
     
-    response = httpx.post(telegram_url, json=payload, timeout=10.0)
-    
-    if response.status_code == 200:
-        logger.info("Reminder notification sent successfully!")
-    else:
-        logger.error(f"Telegram API Rejected Request: {response.text}")
+    try:
+        data = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(
+            telegram_url, 
+            data=data, 
+            headers={'Content-Type': 'application/json'},
+            method='POST'
+        )
+        with urllib.request.urlopen(req, timeout=10.0) as response:
+            if response.status == 200:
+                logger.info("Reminder notification sent successfully!")
+            else:
+                logger.error(f"Telegram returned status: {response.status}")
+                sys.exit(1)
+    except Exception as e:
+        logger.error(f"Failed to send message: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":

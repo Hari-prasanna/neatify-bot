@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: ./aws-bot-iac
+        working-directory: ./src
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -32,4 +32,4 @@ jobs:
           TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: python src/reminder.py
+        run: python reminder.py
