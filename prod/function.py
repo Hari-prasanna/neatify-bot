@@ -431,8 +431,8 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
         await bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
         return {"statusCode": 200}
 
-    # done
-    if "done" in text:
+    # done — match only when the entire message is the word "done" (text is already stripped+lowercased)
+    if text == "done":
         try:
             roomie_res = supabase.table("dim_roommates").select("*").eq("telegram_id", user_id).execute()
             if not roomie_res.data:
