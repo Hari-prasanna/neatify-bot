@@ -1,3 +1,33 @@
+# Secrets
 .env
-bot_layer/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# AWS SAM build artifacts
+.aws-sam/
+samconfig.toml
+*.zip
+
+# macOS
+.DS_Store
+
+# VS Code
+.vscode/
+
+# Local dev notes (keep locally, don't commit)
 notes.md
+
+# Legacy folders
+bot_layer/
+bot/
+lambda/

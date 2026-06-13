@@ -1,0 +1,156 @@
+# src/utils.py — Shared code for dev/main.py, prod/function.py, and src/reminder.py.
+
+import os
+import sys
+import html
+import logging
+import traceback
+from datetime import datetime
+
+from supabase import create_client, Client
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+logger = logging.getLogger(__name__)
+
+BOT_ENV: str = os.environ.get("BOT_ENV", "dev")
+
+_SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+_SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+
+if not _SUPABASE_URL or not _SUPABASE_KEY:
+    raise RuntimeError("SUPABASE_URL and SUPABASE_KEY must be set.")
+
+# Created once at import time — reused across Lambda warm starts.
+supabase: Client = create_client(_SUPABASE_URL, _SUPABASE_KEY)
+
+
+def get_current_week() -> str:
+    return datetime.now().strftime("%Y-W%V")
+
+
+def mention_user(roommate_data: dict) -> str:
+    # @username → inline tg:// link → plain name
+    username = roommate_data.get("telegram_username")
+    if username:
+        return f"@{html.escape(username)}"
+    tg_id = roommate_data.get("telegram_id")
+    name  = html.escape(roommate_data.get("name", "Unknown"))
+    if tg_id:
+        return f'<a href="tg://user?id={tg_id}">{name}</a>'
+    return name
+
+
+def log_to_db(level: str, message: str, error_details: str = None) -> None:
+    try:
+        supabase.table("sys_logs").insert({
+            "log_level":     level,
+            "message":       message,
+            "error_details": error_details,
+            "environment":   BOT_ENV,
+        }).execute()
+    except Exception as e:
+        print(f"\n[log_to_db FAILED] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        logger.error(f"log_to_db failed: {e}")
+
+
+def find_next_person(task_id: int) -> dict | None:
+    """
+    Returns the next eligible rotation_config row (with dim_roommates + dim_tasks joined).
+
+    Layer 1 — priority override: anyone with is_priority_next=True jumps the queue.
+    Layer 2 — cursor: last non-volunteer log for this task_id gives the starting position.
+    Layer 3 — circular walk: steps forward (order % 5 + 1), skips vacationers and
+               skip_next_turn holders (flag consumed immediately). Returns None after 10 steps.
+    """
+    # Layer 1: priority override
+    try:
+        res = (
+            supabase.table("dim_roommates")
+            .select("roommate_id, name, telegram_id, telegram_username")
+            .eq("is_priority_next", True).eq("is_active", True).eq("is_on_vacation", False)
+            .execute()
+        )
+        if res.data:
+            p_id   = res.data[0]["roommate_id"]
+            p_name = res.data[0].get("name", "?")
+            cfg = (
+                supabase.table("rotation_config")
+                .select("*, dim_roommates(*), dim_tasks(*)")
+                .eq("roommate_id", p_id).eq("task_id", task_id)
+                .execute()
+            )
+            if cfg.data:
+                return cfg.data[0]
+            log_to_db("WARNING",
+                      f"Priority person {p_name} (id={p_id}) has no slot in task_id={task_id}")
+    except Exception as e:
+        print(f"\n[find_next_person] priority check: {type(e).__name__}: {e}", flush=True)
+        log_to_db("ERROR", f"priority check failed (task_id={task_id})",
+                  error_details=traceback.format_exc())
+
+    # Layer 2: cursor from last non-volunteer log
+    starting_order = 0
+    try:
+        last = (
+            supabase.table("fct_cleaning_logs").select("roommate_id")
+            .eq("task_id", task_id).eq("is_volunteer", False)
+            .order("cleaned_at", desc=True).limit(1).execute()
+        )
+        if last.data:
+            order_res = (
+                supabase.table("rotation_config").select("sequence_order")
+                .eq("roommate_id", last.data[0]["roommate_id"]).eq("task_id", task_id)
+                .execute()
+            )
+            if order_res.data:
+                starting_order = order_res.data[0]["sequence_order"]
+    except Exception as e:
+        print(f"\n[find_next_person] cursor lookup: {type(e).__name__}: {e}", flush=True)
+        log_to_db("ERROR", f"cursor lookup failed (task_id={task_id})",
+                  error_details=traceback.format_exc())
+
+    # Layer 3: circular walk
+    check_order = starting_order
+    attempts    = 0
+    while attempts < 10:
+        check_order = (check_order % 5) + 1
+        attempts   += 1
+        try:
+            res = (
+                supabase.table("rotation_config")
+                .select("*, dim_roommates(*), dim_tasks(*)")
+                .eq("sequence_order", check_order).eq("task_id", task_id)
+                .execute()
+            )
+        except Exception as e:
+            print(f"\n[find_next_person] walk order={check_order}: {type(e).__name__}: {e}", flush=True)
+            log_to_db("ERROR", f"walk failed at order={check_order}, task_id={task_id}",
+                      error_details=traceback.format_exc())
+            continue
+
+        if not res.data:
+            continue
+
+        candidate = res.data[0]["dim_roommates"]
+        if candidate["is_on_vacation"]:
+            continue
+        if candidate.get("skip_next_turn", False):
+            try:
+                supabase.table("dim_roommates").update({"skip_next_turn": False}).eq(
+                    "roommate_id", candidate["roommate_id"]
+                ).execute()
+                log_to_db("INFO", f"skip_next_turn consumed for {candidate['name']} (task_id={task_id})")
+            except Exception as e:
+                print(f"\n[find_next_person] skip_next_turn reset: {type(e).__name__}: {e}", flush=True)
+                log_to_db("ERROR", f"skip_next_turn reset failed for {candidate['name']}",
+                          error_details=traceback.format_exc())
+            continue
+
+        return res.data[0]
+
+    return None
