@@ -566,7 +566,7 @@ async def handle_deletelast(update: Update, _context: ContextTypes.DEFAULT_TYPE)
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).build()
 
-    done_filter = filters.Chat(chat_id=GROUP_ID) & filters.Regex(r"(?i)\bdone\b")
+    done_filter = filters.Chat(chat_id=GROUP_ID) & filters.Regex(r"(?i)^\s*done\s*$")
     app.add_handler(MessageHandler(done_filter, handle_done_command))
     app.add_handler(CommandHandler("hi",        handle_hi))
     app.add_handler(CommandHandler("help",      handle_help))
