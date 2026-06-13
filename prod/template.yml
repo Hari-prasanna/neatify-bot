@@ -1,9 +1,20 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 
+# prod/template.yml — AWS SAM infrastructure definition.
+#
+# CodeUri: ./  packages the prod/ directory. The deploy workflow copies src/
+# into prod/ before `sam build` so `from src.utils import ...` works at runtime.
+# Handler: function.lambda_handler (function.py lives at the CodeUri root).
+
 Parameters:
   TelegramToken:
     Type: String
+  TelegramSecretToken:
+    Type: String
+  AdminTelegramId:
+    Type: String
+    Default: ""
   SupabaseUrl:
     Type: String
   SupabaseKey:
@@ -13,14 +24,17 @@ Resources:
   RoommateBotFunction:
     Type: AWS::Serverless::Function
     Properties:
-      CodeUri: src/
+      CodeUri: ./
       Handler: function.lambda_handler
       Runtime: python3.13
       Timeout: 30
       MemorySize: 512
       Environment:
         Variables:
+          BOT_ENV: prod
           TELEGRAM_TOKEN: !Ref TelegramToken
+          TELEGRAM_SECRET_TOKEN: !Ref TelegramSecretToken
+          ADMIN_TELEGRAM_ID: !Ref AdminTelegramId
           SUPABASE_URL: !Ref SupabaseUrl
           SUPABASE_KEY: !Ref SupabaseKey
       Events:
@@ -29,6 +43,7 @@ Resources:
           Properties:
             Path: /webhook
             Method: POST
+
 Outputs:
   WebookApiUrl:
     Description: "URL for the Telegram Webhook"

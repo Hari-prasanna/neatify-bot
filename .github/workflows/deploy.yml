@@ -3,21 +3,21 @@ name: Deploy to AWS Lambda
 on:
   push:
     branches:
-      - dev 
+      - dev
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: ./lambda
+        working-directory: ./prod
     steps:
       - uses: actions/checkout@v3
 
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.13' # switching to Python 3.13 to support
+          python-version: '3.13'
 
       - name: Setup AWS SAM
         uses: aws-actions/setup-sam@v2
@@ -28,6 +28,13 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: eu-north-1
+
+      # Copy the shared utilities into the Lambda package before building.
+      # SAM packages only the prod/ directory (CodeUri: ./), so src/ must
+      # be present inside it at build time for `from src.utils import ...` to work.
+      - name: Copy shared utilities into Lambda package
+        working-directory: .
+        run: cp -r src prod/
 
       - name: SAM Build
         run: sam build --use-container
@@ -40,6 +47,8 @@ jobs:
             --capabilities CAPABILITY_IAM \
             --parameter-overrides \
               TelegramToken=${{ secrets.TELEGRAM_TOKEN }} \
+              TelegramSecretToken=${{ secrets.TELEGRAM_SECRET_TOKEN }} \
+              AdminTelegramId=${{ secrets.ADMIN_TELEGRAM_ID }} \
               SupabaseUrl=${{ secrets.SUPABASE_URL }} \
               SupabaseKey=${{ secrets.SUPABASE_KEY }}
 
@@ -54,20 +63,15 @@ jobs:
             --output text
           echo "-------------------------------------------------------"
 
-
-      - name: Automate Telegram Webhook Connection
+      - name: Register Telegram Webhook
         run: |
-          echo "Fetching active endpoint from CloudFormation..."
-          
-          # 1. Capture the live endpoint URL into a pipeline variable
+          echo "Fetching endpoint from CloudFormation..."
           WEBHOOK_URL=$(aws cloudformation describe-stacks \
             --stack-name roommate-bot-stack \
             --query "Stacks[0].Outputs[?OutputKey=='WebookApiUrl'].OutputValue" \
             --output text)
-          
-          echo "Registering endpoint with Telegram API..."
-          
-          # 2. Execute a secure POST request to Telegram to instantly bind the webhook
+
+          echo "Registering webhook with Telegram..."
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/setWebhook" \
             -H "Content-Type: application/json" \
             -d "{\"url\": \"$WEBHOOK_URL\", \"secret_token\": \"${{ secrets.TELEGRAM_SECRET_TOKEN }}\"}"

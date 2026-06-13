@@ -1,45 +1,78 @@
-# Cleaning Rotation Database Schema (3NF)
+# Data Dictionary — Roommate Cleaning Bot
 
-This relational schema is designed for implementation in Supabase. It prioritizes data integrity and utilizes a **3rd Normal Form (3NF)** structure to eliminate redundancy and ensure consistent data tracking.
+All tables live in Supabase (PostgreSQL). See `database/schema.sql` to create them.
 
-## Table A: `dim_roommates` (The Dimension Table)
-This table stores the "Who." It implements **SCD (Slowly Changing Dimension) Type 2** logic to track historical changes, such as a roommate moving out or changing their status.
+---
 
-| Column Name | Type | Description |
-| :--- | :--- | :--- |
-| `roommate_id` | PK (Int) | A unique identifier for each person. |
-| `name` | String | The roommate's name. |
-| `telegram_handle` | String | Unique ID or username used by the bot for tagging. |
-| `is_active` | Boolean | Indicates if the roommate currently lives in the house. |
-| `is_on_vacation` | Boolean | A toggle used for "skip" logic in the rotation. |
-| `effective_start_date` | Date | The date this record version became valid. |
-| `effective_end_date` | Date | The date this record version expired. |
+## `dim_tasks`
 
-## Table B: `dim_tasks` (The Task Definition)
-This table stores the "What"—defining the specific cleaning duties available.
+Stores the two cleaning task types. Seeded once — never changes at runtime.
 
-| Column Name | Type | Description |
-| :--- | :--- | :--- |
-| `task_id` | PK (Int) | Unique identifier for the task. |
-| `task_description` | String | Description of the task (e.g., "Entire Home", "Bathroom Only"). |
+| Column | Type | Description |
+|---|---|---|
+| `task_id` | PK serial | Auto-assigned. 1 = Entire Home, 2 = Bathroom. |
+| `task_description` | text | Human-readable label (e.g. "Entire Home"). |
 
-## Table C: `rotation_config` (The Map)
-This table links roommates to tasks and defines their specific position within the cleaning cycle.
+---
 
-| Column Name | Type | Description |
-| :--- | :--- | :--- |
-| `rotation_id` | PK (Int) | Unique identifier for the rotation mapping. |
-| `roommate_id` | FK (Int) | Reference to `dim_roommates`. |
-| `task_id` | FK (Int) | Reference to `dim_tasks`. |
-| `sequence_order` | Int | Defines the strict rotation order (e.g., 1 to 5). |
+## `dim_roommates`
 
-## Table D: `fct_cleaning_logs` (The Fact Table)
-The heart of the database. This table records every completion event triggered by a "Done" message.
+One row per person. State flags are updated by bot commands.
 
-| Column Name | Type | Description |
-| :--- | :--- | :--- |
-| `log_id` | PK (Int) | Unique identifier for the log entry. |
-| `roommate_id` | FK (Int) | The person who performed the cleaning. |
-| `task_id` | FK (Int) | The task that was completed. |
-| `cleaned_at` | DateTime | Timestamp of when the completion message was sent. |
-| `week_number` | String | Calculated field (e.g., `2026-W22`) used for reporting and analytics. |
+| Column | Type | Description |
+|---|---|---|
+| `roommate_id` | PK serial | Auto-assigned. |
+| `name` | text | Display name, captured from Telegram on /hi. |
+| `telegram_id` | bigint | Numeric Telegram user ID. Used to identify message senders. |
+| `telegram_username` | text | Optional @handle. Refreshed on every /hi. Used for @mentions. |
+| `is_active` | boolean | False until admin runs /activate. Inactive users are ignored by the bot. |
+| `is_on_vacation` | boolean | Set by /vacation, cleared by /back. Both rotation tracks skip this person. |
+| `skip_next_turn` | boolean | Set by /volunteer. Consumed (cleared) by find_next_person() when the walker reaches this person — one-time skip. |
+| `is_priority_next` | boolean | Set by /back (alongside clearing is_on_vacation). This person is returned first by find_next_person(), regardless of rotation order. Cleared when they say done. |
+| `effective_start_date` | timestamptz | When this row was created. |
+| `effective_end_date` | timestamptz | Null while active. Set if the person moves out. |
+
+---
+
+## `rotation_config`
+
+Maps each person to a slot (1–5) in a specific task track. Each track has its own independent slots.
+
+| Column | Type | Description |
+|---|---|---|
+| `rotation_id` | PK serial | Auto-assigned. |
+| `roommate_id` | FK → dim_roommates | Who. |
+| `task_id` | FK → dim_tasks | Which track (1 = Entire Home, 2 = Bathroom). |
+| `sequence_order` | int | Position in the rotation ring (1–5). UNIQUE per (sequence_order, task_id). |
+
+A person needs one row per task track. `/activate 123456789 3 1` creates a row for task 1 at slot 3.
+
+---
+
+## `fct_cleaning_logs`
+
+One row per cleaning event. This is the source of truth for the rotation cursor.
+
+| Column | Type | Description |
+|---|---|---|
+| `log_id` | PK serial | Auto-assigned. |
+| `roommate_id` | FK → dim_roommates | Who cleaned. |
+| `task_id` | FK → dim_tasks | Which task was done. |
+| `cleaned_at` | timestamptz | When the log was created (auto, server time). |
+| `week_number` | text | ISO week string (e.g. `2026-W24`). Used to prevent duplicate logs per person per week. |
+| `is_volunteer` | boolean | True if logged via /volunteer. Volunteer cleans do NOT advance the rotation cursor — find_next_person() ignores them when computing the current position. |
+
+---
+
+## `sys_logs`
+
+Audit trail written by `log_to_db()` in src/utils.py. Check here when something goes wrong.
+
+| Column | Type | Description |
+|---|---|---|
+| `log_id` | PK serial | Auto-assigned. |
+| `log_level` | text | INFO, WARNING, or ERROR. |
+| `message` | text | Short description of what happened. |
+| `error_details` | text | Full Python traceback (populated on errors only). |
+| `environment` | text | "dev" or "prod" — which instance wrote this row. |
+| `created_at` | timestamptz | Auto-set by Supabase. |

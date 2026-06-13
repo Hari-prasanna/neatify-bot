@@ -9,9 +9,6 @@ on:
 jobs:
   remind:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ./bot
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -19,17 +16,18 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.13' 
+          python-version: '3.13'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r src/requirements.txt
 
       - name: Run reminder script
         env:
+          BOT_ENV: prod
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: python reminder.py
+        run: python src/reminder.py
