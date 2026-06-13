@@ -12,6 +12,7 @@ Parameters:
     Type: String
   TelegramSecretToken:
     Type: String
+    Default: ""
   AdminTelegramId:
     Type: String
     Default: ""
