@@ -40,17 +40,23 @@ jobs:
         run: sam build --use-container
 
       - name: SAM Deploy
+        env:
+          T_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          T_SECRET: ${{ secrets.TELEGRAM_SECRET_TOKEN }}
+          T_ADMIN: ${{ secrets.ADMIN_TELEGRAM_ID }}
+          SB_URL: ${{ secrets.SUPABASE_URL }}
+          SB_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
+          PARAMS="TelegramToken=$T_TOKEN \
+            AdminTelegramId=$T_ADMIN \
+            SupabaseUrl=$SB_URL \
+            SupabaseKey=$SB_KEY"
+          [[ -n "$T_SECRET" ]] && PARAMS="$PARAMS TelegramSecretToken=$T_SECRET"
           sam deploy --no-confirm-changeset --no-fail-on-empty-changeset \
             --stack-name roommate-bot-stack \
             --resolve-s3 \
             --capabilities CAPABILITY_IAM \
-            --parameter-overrides \
-              TelegramToken=${{ secrets.TELEGRAM_TOKEN }} \
-              TelegramSecretToken=${{ secrets.TELEGRAM_SECRET_TOKEN }} \
-              AdminTelegramId=${{ secrets.ADMIN_TELEGRAM_ID }} \
-              SupabaseUrl=${{ secrets.SUPABASE_URL }} \
-              SupabaseKey=${{ secrets.SUPABASE_KEY }}
+            --parameter-overrides $PARAMS
 
       - name: Show Webhook URL
         run: |
@@ -64,14 +70,23 @@ jobs:
           echo "-------------------------------------------------------"
 
       - name: Register Telegram Webhook
+        env:
+          T_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          T_SECRET: ${{ secrets.TELEGRAM_SECRET_TOKEN }}
         run: |
-          echo "Fetching endpoint from CloudFormation..."
           WEBHOOK_URL=$(aws cloudformation describe-stacks \
             --stack-name roommate-bot-stack \
             --query "Stacks[0].Outputs[?OutputKey=='WebookApiUrl'].OutputValue" \
             --output text)
 
-          echo "Registering webhook with Telegram..."
-          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/setWebhook" \
+          echo "Registering webhook: $WEBHOOK_URL"
+
+          if [[ -n "$T_SECRET" ]]; then
+            BODY="{\"url\": \"$WEBHOOK_URL\", \"secret_token\": \"$T_SECRET\"}"
+          else
+            BODY="{\"url\": \"$WEBHOOK_URL\"}"
+          fi
+
+          curl -s -X POST "https://api.telegram.org/bot$T_TOKEN/setWebhook" \
             -H "Content-Type: application/json" \
-            -d "{\"url\": \"$WEBHOOK_URL\", \"secret_token\": \"${{ secrets.TELEGRAM_SECRET_TOKEN }}\"}"
+            -d "$BODY"
