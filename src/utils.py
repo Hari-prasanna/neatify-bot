@@ -5,7 +5,7 @@ import sys
 import html
 import logging
 import traceback
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 from supabase import create_client, Client
 
@@ -33,6 +33,26 @@ def get_current_week() -> str:
     return datetime.now().strftime("%Y-W%V")
 
 
+def get_weekend_dates_from_week(week_str: str) -> str:
+    """Convert '2026-W25' to 'Sat 20 Jun – Sun 21 Jun'."""
+    try:
+        year_s, week_s = week_str.split("-W")
+        year = int(year_s)
+        week = int(week_s)
+        # Jan 4 is always in ISO week 1; walk back to that week's Monday
+        jan4 = date(year, 1, 4)
+        week1_monday = jan4 - timedelta(days=jan4.isoweekday() - 1)
+        target_monday = week1_monday + timedelta(weeks=week - 1)
+        saturday = target_monday + timedelta(days=5)
+        sunday   = target_monday + timedelta(days=6)
+        return (
+            f"Sat {saturday.day} {saturday.strftime('%b')}"
+            f" – Sun {sunday.day} {sunday.strftime('%b')}"
+        )
+    except Exception:
+        return week_str
+
+
 def mention_user(roommate_data: dict) -> str:
     # @username → inline tg:// link → plain name
     username = roommate_data.get("telegram_username")
@@ -56,6 +76,79 @@ def log_to_db(level: str, message: str, error_details: str = None) -> None:
     except Exception as e:
         print(f"\n[log_to_db FAILED] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
         logger.error(f"log_to_db failed: {e}")
+
+
+def peek_next_person_id(task_id: int) -> int | None:
+    """
+    Read-only turn check — returns roommate_id of who should clean next for task_id.
+    Unlike find_next_person, this never consumes skip_next_turn flags, so it is
+    safe to call as a guard before deciding whether to accept a 'done' log.
+    """
+    # Priority override
+    try:
+        res = (
+            supabase.table("dim_roommates")
+            .select("roommate_id")
+            .eq("is_priority_next", True).eq("is_active", True).eq("is_on_vacation", False)
+            .execute()
+        )
+        if res.data:
+            cfg = (
+                supabase.table("rotation_config")
+                .select("roommate_id")
+                .eq("roommate_id", res.data[0]["roommate_id"]).eq("task_id", task_id)
+                .execute()
+            )
+            if cfg.data:
+                return cfg.data[0]["roommate_id"]
+    except Exception as e:
+        print(f"\n[peek_next_person_id] priority check: {type(e).__name__}: {e}", flush=True)
+
+    # Cursor
+    starting_order = 0
+    try:
+        last = (
+            supabase.table("fct_cleaning_logs").select("roommate_id")
+            .eq("task_id", task_id).eq("is_volunteer", False)
+            .order("cleaned_at", desc=True).limit(1).execute()
+        )
+        if last.data:
+            order_res = (
+                supabase.table("rotation_config").select("sequence_order")
+                .eq("roommate_id", last.data[0]["roommate_id"]).eq("task_id", task_id)
+                .execute()
+            )
+            if order_res.data:
+                starting_order = order_res.data[0]["sequence_order"]
+    except Exception as e:
+        print(f"\n[peek_next_person_id] cursor: {type(e).__name__}: {e}", flush=True)
+
+    # Circular walk — read-only, skip_next_turn is checked but NOT cleared
+    check_order = starting_order
+    for _ in range(10):
+        check_order = (check_order % 5) + 1
+        try:
+            res = (
+                supabase.table("rotation_config")
+                .select("roommate_id, dim_roommates(is_on_vacation, skip_next_turn, skip_next_turn_task_id)")
+                .eq("sequence_order", check_order).eq("task_id", task_id)
+                .execute()
+            )
+        except Exception:
+            continue
+        if not res.data:
+            continue
+        candidate   = res.data[0]["dim_roommates"]
+        skip_task   = candidate.get("skip_next_turn_task_id")
+        should_skip = (
+            candidate.get("skip_next_turn", False)
+            and (skip_task is None or skip_task == task_id)
+        )
+        if candidate.get("is_on_vacation") or should_skip:
+            continue
+        return res.data[0]["roommate_id"]
+
+    return None
 
 
 def find_next_person(task_id: int) -> dict | None:
@@ -139,11 +232,12 @@ def find_next_person(task_id: int) -> dict | None:
         candidate = res.data[0]["dim_roommates"]
         if candidate["is_on_vacation"]:
             continue
-        if candidate.get("skip_next_turn", False):
+        skip_task = candidate.get("skip_next_turn_task_id")
+        if candidate.get("skip_next_turn", False) and (skip_task is None or skip_task == task_id):
             try:
-                supabase.table("dim_roommates").update({"skip_next_turn": False}).eq(
-                    "roommate_id", candidate["roommate_id"]
-                ).execute()
+                supabase.table("dim_roommates").update({
+                    "skip_next_turn": False, "skip_next_turn_task_id": None,
+                }).eq("roommate_id", candidate["roommate_id"]).execute()
                 log_to_db("INFO", f"skip_next_turn consumed for {candidate['name']} (task_id={task_id})")
             except Exception as e:
                 print(f"\n[find_next_person] skip_next_turn reset: {type(e).__name__}: {e}", flush=True)
