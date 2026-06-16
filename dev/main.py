@@ -1,4 +1,9 @@
 # dev/main.py — Local polling bot. Run with: python dev/main.py
+#
+# Channel split:
+#   Private DMs  → all commands and "done" are handled here; "done" also broadcasts to GROUP_ID
+#   Group chat   → only "done" is accepted; slash commands get a redirect warning
+#   /hi, /activate, /deletelast work in both contexts
 
 import os
 import sys
@@ -37,6 +42,12 @@ GROUP_ID         = int(GROUP_ID_STR)
 TASK_ENTIRE_HOME = 1
 TASK_BATHROOM    = 2
 
+# Sent when a user runs a slash command inside the group instead of a private DM
+_GROUP_WARN = (
+    "📱 Please send commands to me in a <b>private message</b> to keep this chat clean.\n"
+    "Start a DM with me and send the same command there."
+)
+
 
 def is_admin(user_id: int) -> bool:
     return bool(ADMIN_ID) and str(user_id) == ADMIN_ID
@@ -71,6 +82,7 @@ def get_last_cleaned_date(roommate_id: int) -> str:
 
 
 async def handle_hi(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    # /hi works everywhere — needed for group registration flow
     if not update.message or not update.message.from_user:
         return
 
@@ -121,12 +133,13 @@ async def handle_hi(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(msg, parse_mode="HTML")
 
 
-async def handle_done_command(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.from_user:
         return
 
-    user_id  = update.message.from_user.id
-    week_str = get_current_week()
+    user_id    = update.message.from_user.id
+    week_str   = get_current_week()
+    is_private = update.message.chat.type == "private"
 
     try:
         roomie_res = supabase.table("dim_roommates").select("*").eq("telegram_id", user_id).execute()
@@ -177,21 +190,17 @@ async def handle_done_command(update: Update, _context: ContextTypes.DEFAULT_TYP
         # Turn guard: read-only check, does NOT consume skip_next_turn flags.
         expected_rid = peek_next_person_id(task_id)
         if expected_rid is not None and expected_rid != roomie_id:
-            block_msg = (
-                f"🧹 <b>Clean Log</b>\n\n"
-                f"⚠️ It's not your turn yet!\n"
-            )
+            block_msg = "🧹 <b>Clean Log</b>\n\n⚠️ It's not your turn yet!\n"
             try:
                 next_cfg = (
                     supabase.table("rotation_config").select("sequence_order")
-                    .eq("roommate_id", expected_rid).eq("task_id", task_id)
-                    .execute()
+                    .eq("roommate_id", expected_rid).eq("task_id", task_id).execute()
                 )
                 if next_cfg.data:
-                    next_seq = next_cfg.data[0]["sequence_order"]
-                    steps    = (caller_seq - next_seq) % 5 or 5
-                    target_week  = (datetime.now() + timedelta(weeks=steps)).strftime("%Y-W%V")
-                    block_msg += f"• Your next turn: {get_weekend_dates_from_week(target_week)}"
+                    next_seq    = next_cfg.data[0]["sequence_order"]
+                    steps       = (caller_seq - next_seq) % 5 or 5
+                    target_week = (datetime.now() + timedelta(weeks=steps)).strftime("%Y-W%V")
+                    block_msg  += f"• Your next turn: {get_weekend_dates_from_week(target_week)}"
             except Exception as e:
                 print(f"\n[handle_done_command] turn guard calc: {type(e).__name__}: {e}", flush=True)
             await update.message.reply_text(block_msg, parse_mode="HTML")
@@ -202,23 +211,33 @@ async def handle_done_command(update: Update, _context: ContextTypes.DEFAULT_TYP
         }).execute()
         log_to_db("INFO", f"Clean logged: {roomie['name']} / {task_desc} / {week_str}")
 
-        # Consume priority pass if active — one-time use
+        # Consume priority pass — one-time use
         supabase.table("dim_roommates").update({"is_priority_next": False}).eq(
             "roommate_id", roomie_id
         ).execute()
 
         next_config = find_next_person(task_id)
         next_handle = mention_user(next_config["dim_roommates"]) if next_config else "No one available"
+        weekend     = get_weekend_dates_from_week(week_str)
 
-        await update.message.reply_text(
+        private_msg = (
             f"🧹 <b>Clean Logged</b>\n\n"
             f"✅ Logged!\n"
-            f"• By: {mention_user(roomie)}\n"
-            f"• Weekend: {get_weekend_dates_from_week(week_str)}\n"
-            f"• Task: {task_desc}\n\n"
-            f"🔔 Next ({task_desc}): {next_handle}",
-            parse_mode="HTML"
+            f"• Task: {task_desc}\n"
+            f"• Weekend: {weekend}\n\n"
+            f"🔔 Next ({task_desc}): {next_handle}"
         )
+        # Public broadcast shown to the whole house
+        broadcast_msg = (
+            f"📢 <b>Cleaning Update</b>\n\n"
+            f"{mention_user(roomie)} has completed <b>{task_desc}</b>!\n"
+            f"🔔 Next up: {next_handle} — {weekend}"
+        )
+
+        await update.message.reply_text(private_msg, parse_mode="HTML")
+        if is_private:
+            # Send the group announcement separately when "done" comes from a DM
+            await context.bot.send_message(chat_id=GROUP_ID, text=broadcast_msg, parse_mode="HTML")
 
     except Exception as e:
         _err("handle_done_command", e)
@@ -229,14 +248,18 @@ async def handle_done_command(update: Update, _context: ContextTypes.DEFAULT_TYP
 
 
 async def handle_next(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.chat.type != "private":
+        await update.message.reply_text(_GROUP_WARN, parse_mode="HTML")
+        return
+
     user_id  = update.message.from_user.id
     week_str = get_current_week()
 
     try:
-        home_config = find_next_person(TASK_ENTIRE_HOME)
-        bath_config = find_next_person(TASK_BATHROOM)
-        home_handle = mention_user(home_config["dim_roommates"]) if home_config else "No one scheduled"
-        bath_handle = mention_user(bath_config["dim_roommates"]) if bath_config else "No one scheduled"
+        home_config   = find_next_person(TASK_ENTIRE_HOME)
+        bath_config   = find_next_person(TASK_BATHROOM)
+        home_handle   = mention_user(home_config["dim_roommates"]) if home_config else "No one scheduled"
+        bath_handle   = mention_user(bath_config["dim_roommates"]) if bath_config else "No one scheduled"
         current_dates = get_weekend_dates_from_week(week_str)
 
         msg = (
@@ -246,15 +269,15 @@ async def handle_next(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
             f"• 📆 Weekend: {current_dates}"
         )
 
-        # Personal section — fetch full caller data so mention_user works
+        # Personal countdown — fetch caller's rotation slot
         try:
             caller_res = supabase.table("dim_roommates").select(
                 "roommate_id, name, telegram_id, telegram_username"
             ).eq("telegram_id", user_id).execute()
 
             if caller_res.data:
-                caller      = caller_res.data[0]
-                caller_rid  = caller["roommate_id"]
+                caller         = caller_res.data[0]
+                caller_rid     = caller["roommate_id"]
                 caller_mention = mention_user(caller)
 
                 caller_cfg = supabase.table("rotation_config").select(
@@ -271,16 +294,10 @@ async def handle_next(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
                         is_priority = track_next["dim_roommates"].get("is_priority_next", False)
 
                         if caller_rid == next_rid:
-                            # Caller IS the next person
-                            msg += (
-                                f"\n\n🔔 {caller_mention} — your turn: "
-                                f"{current_dates} (this weekend!)"
-                            )
+                            msg += f"\n\n🔔 {caller_mention} — your turn: {current_dates} (this weekend!)"
                         elif not is_priority:
-                            steps = (caller_seq - track_next["sequence_order"]) % 5 or 5
-                            target_week  = (
-                                datetime.now() + timedelta(weeks=steps)
-                            ).strftime("%Y-W%V")
+                            steps        = (caller_seq - track_next["sequence_order"]) % 5 or 5
+                            target_week  = (datetime.now() + timedelta(weeks=steps)).strftime("%Y-W%V")
                             caller_dates = get_weekend_dates_from_week(target_week)
                             msg += (
                                 f"\n\n🕒 {caller_mention} — your turn: {caller_dates}"
@@ -300,6 +317,10 @@ async def handle_next(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def get_status(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.chat.type != "private":
+        await update.message.reply_text(_GROUP_WARN, parse_mode="HTML")
+        return
+
     week_str = get_current_week()
     try:
         res = supabase.table("dim_roommates").select(
@@ -328,6 +349,10 @@ async def get_status(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def handle_last(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.chat.type != "private":
+        await update.message.reply_text(_GROUP_WARN, parse_mode="HTML")
+        return
+
     try:
         res = (
             supabase.table("fct_cleaning_logs")
@@ -362,6 +387,10 @@ async def handle_last(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def set_vacation(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.chat.type != "private":
+        await update.message.reply_text(_GROUP_WARN, parse_mode="HTML")
+        return
+
     user_id = update.message.from_user.id
     try:
         res = supabase.table("dim_roommates").update({"is_on_vacation": True}).eq(
@@ -390,6 +419,11 @@ async def set_vacation(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def handle_skip(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    # /skip is an alias for /vacation — marks you away for the next cycle
+    if update.message.chat.type != "private":
+        await update.message.reply_text(_GROUP_WARN, parse_mode="HTML")
+        return
+
     user_id = update.message.from_user.id
     try:
         res = supabase.table("dim_roommates").update({"is_on_vacation": True}).eq(
@@ -418,6 +452,10 @@ async def handle_skip(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def set_back(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.chat.type != "private":
+        await update.message.reply_text(_GROUP_WARN, parse_mode="HTML")
+        return
+
     user_id = update.message.from_user.id
     try:
         res = supabase.table("dim_roommates").update({
@@ -447,6 +485,10 @@ async def set_back(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_volunteer(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.chat.type != "private":
+        await update.message.reply_text(_GROUP_WARN, parse_mode="HTML")
+        return
+
     user_id  = update.message.from_user.id
     week_str = get_current_week()
     try:
@@ -492,6 +534,10 @@ async def handle_volunteer(update: Update, _context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def handle_help(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.chat.type != "private":
+        await update.message.reply_text(_GROUP_WARN, parse_mode="HTML")
+        return
+
     user_id = update.message.from_user.id
     msg = (
         "📋 <b>Command Reference</b>\n\n"
@@ -519,6 +565,7 @@ async def handle_help(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def handle_activate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Admin command — works in both group and DM
     user_id = update.message.from_user.id
     if not is_admin(user_id):
         await update.message.reply_text("🔧 <b>Activation</b>\n\n🚫 Admin only.", parse_mode="HTML")
@@ -600,6 +647,7 @@ async def handle_activate(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def handle_deletelast(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Admin command — works in both group and DM
     user_id = update.message.from_user.id
     if not is_admin(user_id):
         await update.message.reply_text("🗑️ <b>Delete Log</b>\n\n🚫 Admin only.", parse_mode="HTML")
@@ -650,8 +698,10 @@ async def handle_deletelast(update: Update, _context: ContextTypes.DEFAULT_TYPE)
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).build()
 
-    done_filter = filters.Chat(chat_id=GROUP_ID) & filters.Regex(r"(?i)^\s*done\s*$")
+    # Accept 'done' from private DMs and from the group — handled differently inside the handler
+    done_filter = (filters.ChatType.PRIVATE | filters.Chat(chat_id=GROUP_ID)) & filters.Regex(r"(?i)^\s*done\s*$")
     app.add_handler(MessageHandler(done_filter, handle_done_command))
+
     app.add_handler(CommandHandler("hi",         handle_hi))
     app.add_handler(CommandHandler("help",       handle_help))
     app.add_handler(CommandHandler("status",     get_status))
