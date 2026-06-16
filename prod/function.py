@@ -1,5 +1,10 @@
 # prod/function.py — AWS Lambda webhook handler.
 # deploy.yml copies src/ here before sam build so `from src.utils import ...` works on Lambda.
+#
+# Channel split:
+#   Private DMs  → all commands and "done" are handled; "done" also broadcasts to GROUP_ID
+#   Group chat   → only "done" and /hi, /activate, /deletelast are accepted
+#   Everything else in the group gets a redirect warning (use DMs)
 
 import os
 import sys
@@ -29,8 +34,15 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 ADMIN_ID         = os.environ.get("ADMIN_TELEGRAM_ID", "")
+GROUP_ID         = int(os.environ.get("TELEGRAM_GROUP_ID", "0"))
 TASK_ENTIRE_HOME = 1
 TASK_BATHROOM    = 2
+
+# Sent when a user runs a slash command inside the group instead of a private DM
+_GROUP_WARN = (
+    "📱 Please send commands to me in a <b>private message</b> to keep this chat clean.\n"
+    "Start a DM with me and send the same command there."
+)
 
 
 def is_admin(user_id: int) -> bool:
@@ -53,7 +65,7 @@ def get_last_cleaned_date(roommate_id: int) -> str:
 
 async def process_update(event: dict, bot: telegram.Bot) -> dict:
     # Verify the secret header set during webhook registration
-    headers = event.get("headers", {})
+    headers  = event.get("headers", {})
     expected = os.environ.get("TELEGRAM_SECRET_TOKEN")
     if expected and headers.get("x-telegram-bot-api-secret-token") != expected:
         logger.warning("Unauthorized — secret token mismatch.")
@@ -62,18 +74,19 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
     body   = json.loads(event.get("body", "{}"))
     update = telegram.Update.de_json(body, bot)
 
-    if not update.message or not update.message.text:
+    if not update.message or not update.message.text or not update.message.from_user:
         return {"statusCode": 200}
 
-    user_id   = update.message.from_user.id
-    username  = update.message.from_user.username
-    user_name = update.message.from_user.first_name or username or "Unknown"
-    text      = update.message.text.strip().lower()
-    raw_text  = update.message.text.strip()
-    chat_id   = update.message.chat.id
-    week_str  = get_current_week()
+    user_id    = update.message.from_user.id
+    username   = update.message.from_user.username
+    user_name  = update.message.from_user.first_name or username or "Unknown"
+    text       = update.message.text.strip().lower()
+    raw_text   = update.message.text.strip()
+    chat_id    = update.message.chat.id
+    is_private = update.message.chat.type == "private"
+    week_str   = get_current_week()
 
-    # /hi
+    # /hi — works everywhere (needed for group registration flow)
     if text == "/hi":
         name = html.escape(user_name)
         try:
@@ -117,8 +130,11 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
         await bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
         return {"statusCode": 200}
 
-    # /help
+    # /help — DM only
     if text == "/help":
+        if not is_private:
+            await bot.send_message(chat_id=chat_id, text=_GROUP_WARN, parse_mode="HTML")
+            return {"statusCode": 200}
         msg = (
             "📋 <b>Command Reference</b>\n\n"
             "<b>Cleaning Rotation</b>\n"
@@ -144,8 +160,11 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
         await bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
         return {"statusCode": 200}
 
-    # /status
+    # /status — DM only
     if text == "/status":
+        if not is_private:
+            await bot.send_message(chat_id=chat_id, text=_GROUP_WARN, parse_mode="HTML")
+            return {"statusCode": 200}
         try:
             res = supabase.table("dim_roommates").select(
                 "roommate_id, name, telegram_id, telegram_username, is_on_vacation"
@@ -166,11 +185,14 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
         await bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
         return {"statusCode": 200}
 
-    # /next
+    # /next — DM only
     if text == "/next":
+        if not is_private:
+            await bot.send_message(chat_id=chat_id, text=_GROUP_WARN, parse_mode="HTML")
+            return {"statusCode": 200}
         try:
-            home_config = find_next_person(TASK_ENTIRE_HOME)
-            bath_config = find_next_person(TASK_BATHROOM)
+            home_config   = find_next_person(TASK_ENTIRE_HOME)
+            bath_config   = find_next_person(TASK_BATHROOM)
             home_handle   = mention_user(home_config["dim_roommates"]) if home_config else "No one scheduled"
             bath_handle   = mention_user(bath_config["dim_roommates"]) if bath_config else "No one scheduled"
             current_dates = get_weekend_dates_from_week(week_str)
@@ -231,8 +253,11 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
         await bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
         return {"statusCode": 200}
 
-    # /last
+    # /last — DM only
     if text == "/last":
+        if not is_private:
+            await bot.send_message(chat_id=chat_id, text=_GROUP_WARN, parse_mode="HTML")
+            return {"statusCode": 200}
         try:
             res = (
                 supabase.table("fct_cleaning_logs")
@@ -259,8 +284,11 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
         await bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
         return {"statusCode": 200}
 
-    # /vacation
+    # /vacation — DM only
     if text == "/vacation":
+        if not is_private:
+            await bot.send_message(chat_id=chat_id, text=_GROUP_WARN, parse_mode="HTML")
+            return {"statusCode": 200}
         try:
             res = supabase.table("dim_roommates").update({"is_on_vacation": True}).eq(
                 "telegram_id", user_id
@@ -281,8 +309,11 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
         await bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
         return {"statusCode": 200}
 
-    # /skip
+    # /skip — DM only
     if text == "/skip":
+        if not is_private:
+            await bot.send_message(chat_id=chat_id, text=_GROUP_WARN, parse_mode="HTML")
+            return {"statusCode": 200}
         try:
             res = supabase.table("dim_roommates").update({"is_on_vacation": True}).eq(
                 "telegram_id", user_id
@@ -303,8 +334,11 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
         await bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
         return {"statusCode": 200}
 
-    # /back
+    # /back — DM only
     if text == "/back":
+        if not is_private:
+            await bot.send_message(chat_id=chat_id, text=_GROUP_WARN, parse_mode="HTML")
+            return {"statusCode": 200}
         try:
             res = supabase.table("dim_roommates").update({
                 "is_on_vacation": False, "is_priority_next": True,
@@ -325,8 +359,11 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
         await bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
         return {"statusCode": 200}
 
-    # /volunteer
+    # /volunteer — DM only
     if text == "/volunteer":
+        if not is_private:
+            await bot.send_message(chat_id=chat_id, text=_GROUP_WARN, parse_mode="HTML")
+            return {"statusCode": 200}
         try:
             roomie_res = supabase.table("dim_roommates").select("*").eq(
                 "telegram_id", user_id
@@ -362,7 +399,7 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
         await bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
         return {"statusCode": 200}
 
-    # /activate
+    # /activate — admin only, works everywhere
     if text.startswith("/activate"):
         if not is_admin(user_id):
             await bot.send_message(chat_id=chat_id,
@@ -448,7 +485,7 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
         await bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
         return {"statusCode": 200}
 
-    # /deletelast
+    # /deletelast — admin only, works everywhere
     if text == "/deletelast":
         if not is_admin(user_id):
             await bot.send_message(chat_id=chat_id,
@@ -487,7 +524,7 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
         await bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
         return {"statusCode": 200}
 
-    # done — match only when the entire message is the word "done"
+    # done — accepted from private DMs and the group; broadcast is DM-only
     if text == "done":
         try:
             roomie_res = supabase.table("dim_roommates").select("*").eq("telegram_id", user_id).execute()
@@ -543,10 +580,7 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
             # Turn guard: read-only check, does NOT consume skip_next_turn flags.
             expected_rid = peek_next_person_id(task_id)
             if expected_rid is not None and expected_rid != roomie_id:
-                block_msg = (
-                    f"🧹 <b>Clean Log</b>\n\n"
-                    f"⚠️ It's not your turn yet!\n"
-                )
+                block_msg = "🧹 <b>Clean Log</b>\n\n⚠️ It's not your turn yet!\n"
                 try:
                     next_cfg = (
                         supabase.table("rotation_config").select("sequence_order")
@@ -575,19 +609,43 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
 
             next_config = find_next_person(task_id)
             next_handle = mention_user(next_config["dim_roommates"]) if next_config else "No one available"
+            weekend     = get_weekend_dates_from_week(week_str)
 
-            msg = (
-                f"🧹 <b>Clean Logged</b>\n\n"
-                f"✅ Logged!\n"
-                f"• By: {mention_user(roomie)}\n"
-                f"• Weekend: {get_weekend_dates_from_week(week_str)}\n"
-                f"• Task: {task_desc}\n\n"
-                f"🔔 Next ({task_desc}): {next_handle}"
-            )
+            if is_private:
+                # DM: send private confirmation, then broadcast to the group
+                private_msg = (
+                    f"🧹 <b>Clean Logged</b>\n\n"
+                    f"✅ Logged!\n"
+                    f"• Task: {task_desc}\n"
+                    f"• Weekend: {weekend}\n\n"
+                    f"🔔 Next ({task_desc}): {next_handle}"
+                )
+                broadcast_msg = (
+                    f"📢 <b>Cleaning Update</b>\n\n"
+                    f"{mention_user(roomie)} has completed <b>{task_desc}</b>!\n"
+                    f"🔔 Next up: {next_handle} — {weekend}"
+                )
+                await bot.send_message(chat_id=chat_id, text=private_msg, parse_mode="HTML")
+                await bot.send_message(chat_id=GROUP_ID, text=broadcast_msg, parse_mode="HTML")
+            else:
+                # Group: reply in-place (old behaviour, kept for users who still type there)
+                msg = (
+                    f"🧹 <b>Clean Logged</b>\n\n"
+                    f"✅ Logged!\n"
+                    f"• By: {mention_user(roomie)}\n"
+                    f"• Weekend: {weekend}\n"
+                    f"• Task: {task_desc}\n\n"
+                    f"🔔 Next ({task_desc}): {next_handle}"
+                )
+                await bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+
         except Exception:
             log_to_db("ERROR", "handle_done failed", error_details=traceback.format_exc())
-            msg = "⚠️ Something went wrong. Check CloudWatch logs."
-        await bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+            await bot.send_message(
+                chat_id=chat_id,
+                text="⚠️ Something went wrong. Check CloudWatch logs.",
+                parse_mode="HTML"
+            )
         return {"statusCode": 200}
 
     return {"statusCode": 200}
