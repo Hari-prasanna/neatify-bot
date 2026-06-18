@@ -22,14 +22,14 @@ try:
     from src.utils import (
         supabase, get_current_week, get_weekend_dates_from_week,
         log_to_db, log_interaction, find_next_person, peek_next_person_id,
-        mention_user, compute_turn_offset,
+        peek_next_n_persons, mention_user, compute_turn_offset,
     )
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from src.utils import (
         supabase, get_current_week, get_weekend_dates_from_week,
         log_to_db, log_interaction, find_next_person, peek_next_person_id,
-        mention_user, compute_turn_offset,
+        peek_next_n_persons, mention_user, compute_turn_offset,
     )
 
 logger = logging.getLogger()
@@ -198,20 +198,28 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
             await bot.send_message(chat_id=chat_id, text=_GROUP_WARN, parse_mode="HTML")
             return {"statusCode": 200}
         try:
-            home_config   = find_next_person(TASK_ENTIRE_HOME)
-            bath_config   = find_next_person(TASK_BATHROOM)
-            home_handle   = mention_user(home_config["dim_roommates"]) if home_config else "No one scheduled"
-            bath_handle   = mention_user(bath_config["dim_roommates"]) if bath_config else "No one scheduled"
-            current_dates = get_weekend_dates_from_week(week_str)
+            home_turns = peek_next_n_persons(TASK_ENTIRE_HOME, 3)
+            bath_turns = peek_next_n_persons(TASK_BATHROOM, 3)
+
+            def _turns_section(turns: list[dict]) -> str:
+                if not turns:
+                    return "• No one scheduled"
+                lines = []
+                for i, person in enumerate(turns):
+                    handle = mention_user(person)
+                    w      = (datetime.now() + timedelta(weeks=i)).strftime("%Y-W%V")
+                    dates  = get_weekend_dates_from_week(w)
+                    prefix = f"• 🔔 {handle} — this weekend ({dates})" if i == 0 else f"• {handle} — {dates}"
+                    lines.append(prefix)
+                return "\n".join(lines)
 
             msg = (
                 f"📅 <b>Upcoming Schedule</b>\n\n"
-                f"• 🏠 Home: {home_handle}\n"
-                f"• 🚿 Bathroom: {bath_handle}\n"
-                f"• 📆 Weekend: {current_dates}"
+                f"🏠 <b>Entire Home</b>\n{_turns_section(home_turns)}\n\n"
+                f"🚿 <b>Bathroom</b>\n{_turns_section(bath_turns)}"
             )
 
-            # Personal section — fetch full caller data including banked skips
+            # Personal section — fetch caller's rotation slot and banked skips
             try:
                 caller_res = supabase.table("dim_roommates").select(
                     "roommate_id, name, telegram_id, telegram_username, skip_turn_count"
@@ -223,24 +231,22 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
                     caller_mention = mention_user(caller)
 
                     caller_cfg = supabase.table("rotation_config").select(
-                        "sequence_order, task_id"
+                        "task_id"
                     ).eq("roommate_id", caller_rid).limit(1).execute()
 
                     if caller_cfg.data:
-                        caller_seq  = caller_cfg.data[0]["sequence_order"]
                         caller_task = caller_cfg.data[0]["task_id"]
-                        track_next  = home_config if caller_task == TASK_ENTIRE_HOME else bath_config
+                        track_turns = home_turns if caller_task == TASK_ENTIRE_HOME else bath_turns
 
-                        if track_next:
-                            next_rid    = track_next["dim_roommates"]["roommate_id"]
-                            is_priority = track_next["dim_roommates"].get("is_priority_next", False)
-
+                        if track_turns:
+                            next_rid = track_turns[0]["roommate_id"]
                             if caller_rid == next_rid:
+                                current_dates = get_weekend_dates_from_week(week_str)
                                 msg += (
                                     f"\n\n🔔 {caller_mention} — your turn: "
                                     f"{current_dates} (this weekend!)"
                                 )
-                            elif not is_priority:
+                            else:
                                 steps        = compute_turn_offset(
                                     caller_rid, caller.get("skip_turn_count") or 0,
                                     next_rid,   caller_task,

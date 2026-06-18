@@ -1,5 +1,9 @@
 # src/reminder.py — Friday reminder cron. Run by GitHub Actions delivery.yml every Friday 07:00 UTC.
 # Checks only Task 1 (Entire Home) — Bathroom track is never included in this reminder.
+#
+# Sends two messages:
+#   1. Group broadcast — visible to everyone, shows who is on deck
+#   2. Private DM    — personal nudge directly to the scheduled person (if telegram_id is known)
 
 import os
 import sys
@@ -18,6 +22,23 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("reminder")
 
 ENTIRE_HOME_TASK_ID = 1
+
+
+def _send(token: str, chat_id: int, text: str) -> bool:
+    """POST a message to Telegram. Returns True on success."""
+    url     = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req  = urllib.request.Request(
+            url, data=data,
+            headers={"Content-Type": "application/json"}, method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            return resp.status == 200
+    except Exception as e:
+        logger.error(f"Telegram send failed (chat_id={chat_id}): {e}")
+        return False
 
 
 def run_reminder() -> None:
@@ -42,7 +63,7 @@ def run_reminder() -> None:
     handle  = mention_user(roomie)
     weekend = get_weekend_dates_from_week(week_str)
 
-    # Skip if this person already logged done for the current week
+    # Skip entirely if the person already logged done this week
     try:
         done_check = (
             supabase.table("fct_cleaning_logs").select("log_id")
@@ -60,7 +81,8 @@ def run_reminder() -> None:
     except Exception as e:
         log_to_db("WARNING", f"Friday reminder done-check failed: {e}")
 
-    message = (
+    # ── 1. Group broadcast ────────────────────────────────────────────────────
+    group_msg = (
         f"🧹 <b>Friday Reminder</b>\n\n"
         f"• Week: <code>{week_str}</code>\n"
         f"• Dates: {weekend}\n"
@@ -69,28 +91,41 @@ def run_reminder() -> None:
         f"📱 Send <b>done</b> as a private message to the bot when finished!"
     )
 
-    telegram_url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": int(group_id), "text": message, "parse_mode": "HTML"}
-
-    try:
-        data = json.dumps(payload).encode("utf-8")
-        req  = urllib.request.Request(
-            telegram_url, data=data,
-            headers={"Content-Type": "application/json"}, method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=10.0) as response:
-            if response.status == 200:
-                logger.info(f"Reminder sent: {roomie['name']} / {week_str}")
-                log_to_db("INFO",
-                          f"Friday reminder sent: {roomie['name']} / "
-                          f"{task['task_description']} / {week_str}")
-            else:
-                logger.error(f"Telegram returned status: {response.status}")
-                sys.exit(1)
-    except Exception as e:
-        logger.error(f"Failed to send reminder: {e}")
-        log_to_db("ERROR", "Friday reminder send failed", error_details=str(e))
+    ok = _send(token, int(group_id), group_msg)
+    if ok:
+        logger.info(f"Group reminder sent: {roomie['name']} / {week_str}")
+        log_to_db("INFO",
+                  f"Friday reminder sent (group): {roomie['name']} / "
+                  f"{task['task_description']} / {week_str}")
+    else:
+        logger.error("Group reminder failed.")
+        log_to_db("ERROR", "Friday reminder group send failed")
         sys.exit(1)
+
+    # ── 2. Private DM to the scheduled person ─────────────────────────────────
+    # Only possible if they've previously messaged the bot (telegram_id known).
+    personal_tg_id = roomie.get("telegram_id")
+    if not personal_tg_id:
+        logger.info(f"Skipping private DM — no telegram_id for {roomie['name']}.")
+        return
+
+    dm_msg = (
+        f"🧹 <b>Hey {roomie['name']}!</b>\n\n"
+        f"You're on deck this weekend.\n"
+        f"• Task: {task['task_description']}\n"
+        f"• Dates: {weekend}\n\n"
+        f"Send <b>done</b> here when you're finished and I'll update the group. 🙌"
+    )
+
+    dm_ok = _send(token, int(personal_tg_id), dm_msg)
+    if dm_ok:
+        logger.info(f"Private DM sent to {roomie['name']} (tg_id={personal_tg_id})")
+        log_to_db("INFO", f"Friday reminder sent (DM): {roomie['name']} / {week_str}")
+    else:
+        # DM failure is non-fatal — group message already went through
+        logger.warning(f"Private DM failed for {roomie['name']} (tg_id={personal_tg_id})")
+        log_to_db("WARNING",
+                  f"Friday reminder DM failed: {roomie['name']} (tg_id={personal_tg_id})")
 
 
 if __name__ == "__main__":
