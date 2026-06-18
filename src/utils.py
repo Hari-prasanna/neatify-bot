@@ -78,10 +78,23 @@ def log_to_db(level: str, message: str, error_details: str = None) -> None:
         logger.error(f"log_to_db failed: {e}")
 
 
+def log_interaction(telegram_id: int, name: str, command: str) -> None:
+    """Record every private-chat message for engagement analytics."""
+    try:
+        supabase.table("interaction_logs").insert({
+            "telegram_id": telegram_id,
+            "name":        name,
+            "command":     command,
+            "environment": BOT_ENV,
+        }).execute()
+    except Exception as e:
+        print(f"\n[log_interaction FAILED] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+
+
 def peek_next_person_id(task_id: int) -> int | None:
     """
     Read-only turn check — returns roommate_id of who should clean next for task_id.
-    Unlike find_next_person, this never consumes skip_next_turn flags, so it is
+    Unlike find_next_person, this never decrements skip_turn_count, so it is
     safe to call as a guard before deciding whether to accept a 'done' log.
     """
     # Priority override
@@ -123,14 +136,28 @@ def peek_next_person_id(task_id: int) -> int | None:
     except Exception as e:
         print(f"\n[peek_next_person_id] cursor: {type(e).__name__}: {e}", flush=True)
 
-    # Circular walk — read-only, skip_next_turn is checked but NOT cleared
+    # Pre-fetch who already logged a scheduled clean this week for this task.
+    # If admin deletes a log, the cursor may regress and the walk could re-select
+    # someone who has an existing log this week — this set prevents that.
+    done_this_week: set = set()
+    try:
+        done_res = (
+            supabase.table("fct_cleaning_logs").select("roommate_id")
+            .eq("week_number", get_current_week()).eq("is_volunteer", False).eq("task_id", task_id)
+            .execute()
+        )
+        done_this_week = {r["roommate_id"] for r in done_res.data}
+    except Exception:
+        pass
+
+    # Circular walk — read-only, skip_turn_count is inspected but NOT decremented
     check_order = starting_order
     for _ in range(10):
         check_order = (check_order % 5) + 1
         try:
             res = (
                 supabase.table("rotation_config")
-                .select("roommate_id, dim_roommates(is_on_vacation, skip_next_turn, skip_next_turn_task_id)")
+                .select("roommate_id, dim_roommates(is_on_vacation, skip_turn_count, skip_next_turn_task_id)")
                 .eq("sequence_order", check_order).eq("task_id", task_id)
                 .execute()
             )
@@ -141,10 +168,11 @@ def peek_next_person_id(task_id: int) -> int | None:
         candidate   = res.data[0]["dim_roommates"]
         skip_task   = candidate.get("skip_next_turn_task_id")
         should_skip = (
-            candidate.get("skip_next_turn", False)
+            (candidate.get("skip_turn_count") or 0) > 0
             and (skip_task is None or skip_task == task_id)
         )
-        if candidate.get("is_on_vacation") or should_skip:
+        if (candidate.get("is_on_vacation") or should_skip
+                or res.data[0]["roommate_id"] in done_this_week):
             continue
         return res.data[0]["roommate_id"]
 
@@ -158,7 +186,7 @@ def find_next_person(task_id: int) -> dict | None:
     Layer 1 — priority override: anyone with is_priority_next=True jumps the queue.
     Layer 2 — cursor: last non-volunteer log for this task_id gives the starting position.
     Layer 3 — circular walk: steps forward (order % 5 + 1), skips vacationers and
-               skip_next_turn holders (flag consumed immediately). Returns None after 10 steps.
+               skip_turn_count holders (count decremented immediately). Returns None after 10 steps.
     """
     # Layer 1: priority override
     try:
@@ -207,6 +235,19 @@ def find_next_person(task_id: int) -> dict | None:
         log_to_db("ERROR", f"cursor lookup failed (task_id={task_id})",
                   error_details=traceback.format_exc())
 
+    # Pre-fetch who already logged a scheduled clean this week for this task.
+    # Prevents re-selecting someone after a log deletion shifts the cursor backward.
+    done_this_week: set = set()
+    try:
+        done_res = (
+            supabase.table("fct_cleaning_logs").select("roommate_id")
+            .eq("week_number", get_current_week()).eq("is_volunteer", False).eq("task_id", task_id)
+            .execute()
+        )
+        done_this_week = {r["roommate_id"] for r in done_res.data}
+    except Exception:
+        pass
+
     # Layer 3: circular walk
     check_order = starting_order
     attempts    = 0
@@ -230,18 +271,22 @@ def find_next_person(task_id: int) -> dict | None:
             continue
 
         candidate = res.data[0]["dim_roommates"]
-        if candidate["is_on_vacation"]:
+        if candidate["is_on_vacation"] or res.data[0]["roommate_id"] in done_this_week:
             continue
-        skip_task = candidate.get("skip_next_turn_task_id")
-        if candidate.get("skip_next_turn", False) and (skip_task is None or skip_task == task_id):
+        skip_task  = candidate.get("skip_next_turn_task_id")
+        skip_count = candidate.get("skip_turn_count") or 0
+        if skip_count > 0 and (skip_task is None or skip_task == task_id):
+            new_count = skip_count - 1
             try:
                 supabase.table("dim_roommates").update({
-                    "skip_next_turn": False, "skip_next_turn_task_id": None,
+                    "skip_turn_count": new_count,
                 }).eq("roommate_id", candidate["roommate_id"]).execute()
-                log_to_db("INFO", f"skip_next_turn consumed for {candidate['name']} (task_id={task_id})")
+                log_to_db("INFO",
+                          f"skip_turn_count decremented for {candidate['name']}: "
+                          f"{skip_count} → {new_count} remaining (task_id={task_id})")
             except Exception as e:
-                print(f"\n[find_next_person] skip_next_turn reset: {type(e).__name__}: {e}", flush=True)
-                log_to_db("ERROR", f"skip_next_turn reset failed for {candidate['name']}",
+                print(f"\n[find_next_person] skip_turn_count update: {type(e).__name__}: {e}", flush=True)
+                log_to_db("ERROR", f"skip_turn_count update failed for {candidate['name']}",
                           error_details=traceback.format_exc())
             continue
 

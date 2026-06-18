@@ -21,7 +21,7 @@ from telegram.ext import (
 )
 from src.utils import (
     supabase, BOT_ENV, get_current_week, get_weekend_dates_from_week,
-    log_to_db, find_next_person, peek_next_person_id, mention_user,
+    log_to_db, log_interaction, find_next_person, peek_next_person_id, mention_user,
 )
 
 logging.basicConfig(
@@ -187,7 +187,7 @@ async def handle_done_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         task_desc  = html.escape(task["dim_tasks"]["task_description"])
         caller_seq = task["sequence_order"]
 
-        # Turn guard: read-only check, does NOT consume skip_next_turn flags.
+        # Turn guard: read-only check, does NOT decrement skip_turn_count.
         expected_rid = peek_next_person_id(task_id)
         if expected_rid is not None and expected_rid != roomie_id:
             block_msg = "🧹 <b>Clean Log</b>\n\n⚠️ It's not your turn yet!\n"
@@ -206,25 +206,39 @@ async def handle_done_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(block_msg, parse_mode="HTML")
             return
 
+        # Capture volunteer state before clearing — needed to pass priority to the replaced person
+        is_volunteer_priority = bool(roomie.get("is_priority_next")) and bool(roomie.get("volunteer_replacing_id"))
+        replacing_rid         = roomie.get("volunteer_replacing_id")
+
         supabase.table("fct_cleaning_logs").insert({
             "roommate_id": roomie_id, "task_id": task_id, "week_number": week_str,
         }).execute()
         log_to_db("INFO", f"Clean logged: {roomie['name']} / {task_desc} / {week_str}")
 
-        # Consume priority pass — one-time use
-        supabase.table("dim_roommates").update({"is_priority_next": False}).eq(
-            "roommate_id", roomie_id
-        ).execute()
+        # Consume priority pass — one-time use; clear replacing pointer too
+        supabase.table("dim_roommates").update({
+            "is_priority_next":       False,
+            "volunteer_replacing_id": None,
+        }).eq("roommate_id", roomie_id).execute()
+
+        # If this was a volunteer doing their donated clean, restore priority to the original person
+        if is_volunteer_priority and replacing_rid:
+            supabase.table("dim_roommates").update({"is_priority_next": True}).eq(
+                "roommate_id", replacing_rid
+            ).execute()
+            log_to_db("INFO",
+                      f"Priority passed to roommate_id={replacing_rid} after volunteer done ({roomie['name']})")
 
         next_config = find_next_person(task_id)
         next_handle = mention_user(next_config["dim_roommates"]) if next_config else "No one available"
         weekend     = get_weekend_dates_from_week(week_str)
 
+        vol_line    = "\n🎟️ Volunteer logged — your banked skip still applies." if is_volunteer_priority else ""
         private_msg = (
             f"🧹 <b>Clean Logged</b>\n\n"
             f"✅ Logged!\n"
             f"• Task: {task_desc}\n"
-            f"• Weekend: {weekend}\n\n"
+            f"• Weekend: {weekend}{vol_line}\n\n"
             f"🔔 Next ({task_desc}): {next_handle}"
         )
         # Public broadcast shown to the whole house
@@ -269,10 +283,10 @@ async def handle_next(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
             f"• 📆 Weekend: {current_dates}"
         )
 
-        # Personal countdown — fetch caller's rotation slot
+        # Personal countdown — fetch caller's rotation slot and banked skips
         try:
             caller_res = supabase.table("dim_roommates").select(
-                "roommate_id, name, telegram_id, telegram_username"
+                "roommate_id, name, telegram_id, telegram_username, skip_turn_count"
             ).eq("telegram_id", user_id).execute()
 
             if caller_res.data:
@@ -296,7 +310,10 @@ async def handle_next(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
                         if caller_rid == next_rid:
                             msg += f"\n\n🔔 {caller_mention} — your turn: {current_dates} (this weekend!)"
                         elif not is_priority:
-                            steps        = (caller_seq - track_next["sequence_order"]) % 5 or 5
+                            # Each banked skip shifts the caller's turn one full cycle (5 weeks) later
+                            skip_banked  = (caller.get("skip_turn_count") or 0)
+                            raw_steps    = (caller_seq - track_next["sequence_order"]) % 5 or 5
+                            steps        = raw_steps + skip_banked * 5
                             target_week  = (datetime.now() + timedelta(weeks=steps)).strftime("%Y-W%V")
                             caller_dates = get_weekend_dates_from_week(target_week)
                             msg += (
@@ -507,27 +524,137 @@ async def handle_volunteer(update: Update, _context: ContextTypes.DEFAULT_TYPE) 
             .eq("roommate_id", roomie["roommate_id"]).limit(1).execute()
         )
         vol_task_id = cfg_res.data[0]["task_id"] if cfg_res.data else TASK_ENTIRE_HOME
+
+        # Who is currently scheduled? Store them so priority can be handed back after volunteer's done.
+        replacing_rid = peek_next_person_id(vol_task_id)
+        if replacing_rid == roomie["roommate_id"]:
+            replacing_rid = None  # Volunteer IS the scheduled person — no hand-off needed
+
         supabase.table("fct_cleaning_logs").insert({
             "roommate_id": roomie["roommate_id"], "task_id": vol_task_id,
             "week_number": week_str, "is_volunteer": True,
         }).execute()
+        new_skip_count = (roomie.get("skip_turn_count") or 0) + 1
         supabase.table("dim_roommates").update({
-            "skip_next_turn": True, "skip_next_turn_task_id": vol_task_id,
+            "skip_turn_count":        new_skip_count,
+            "skip_next_turn_task_id": vol_task_id,
+            "is_priority_next":       True,          # Lets volunteer pass the turn guard on 'done'
+            "volunteer_replacing_id": replacing_rid, # Who to restore priority to after done
         }).eq("roommate_id", roomie["roommate_id"]).execute()
-        log_to_db("INFO", f"Volunteer + skip_next_turn(task={vol_task_id}) set for {roomie['name']}")
+        log_to_db("INFO",
+                  f"Volunteer: skip_turn_count → {new_skip_count} (task={vol_task_id}) "
+                  f"for {roomie['name']}, replacing_rid={replacing_rid}")
 
+        skip_word  = "skip pass" if new_skip_count == 1 else f"{new_skip_count} skip passes"
+        skip_turns = "next turn" if new_skip_count == 1 else f"next {new_skip_count} turns"
         await update.message.reply_text(
             f"🌟 <b>Volunteer Clean Logged</b>\n\n"
             f"✅ Extra clean recorded!\n"
             f"• By: {mention_user(roomie)}\n"
             f"• Weekend: {get_weekend_dates_from_week(week_str)}\n\n"
-            f"🎟️ Skip pass granted — next scheduled turn is waived.",
+            f"🎟️ {skip_word} banked — {skip_turns} waived.",
             parse_mode="HTML"
         )
 
     except Exception as e:
         _err("handle_volunteer", e)
         log_to_db("ERROR", "handle_volunteer failed", error_details=traceback.format_exc())
+        await update.message.reply_text(
+            "⚠️ Something went wrong — check the terminal for the full error.", parse_mode="HTML"
+        )
+
+
+async def handle_myturn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.chat.type != "private":
+        await update.message.reply_text(_GROUP_WARN, parse_mode="HTML")
+        return
+
+    user_id = update.message.from_user.id
+    try:
+        if context.args:
+            target_username = context.args[0].lstrip("@")
+            target_res = supabase.table("dim_roommates").select(
+                "roommate_id, name, telegram_id, telegram_username, skip_turn_count"
+            ).ilike("telegram_username", target_username).execute()
+            if not target_res.data:
+                await update.message.reply_text(
+                    f"🕒 <b>Turn Lookup</b>\n\n"
+                    f"❌ No user found with username @{html.escape(target_username)}.\n"
+                    f"Make sure they've sent /hi so their @username is registered.",
+                    parse_mode="HTML"
+                )
+                return
+            target = target_res.data[0]
+        else:
+            target_res = supabase.table("dim_roommates").select(
+                "roommate_id, name, telegram_id, telegram_username, skip_turn_count"
+            ).eq("telegram_id", user_id).execute()
+            if not target_res.data:
+                await update.message.reply_text(
+                    "🕒 <b>Turn Lookup</b>\n\n❌ Not registered. Send /hi first.",
+                    parse_mode="HTML"
+                )
+                return
+            target = target_res.data[0]
+
+        target_rid     = target["roommate_id"]
+        target_mention = mention_user(target)
+        week_str       = get_current_week()
+
+        slots = (
+            supabase.table("rotation_config")
+            .select("task_id, sequence_order, dim_tasks(task_description)")
+            .eq("roommate_id", target_rid).execute()
+        )
+        if not slots.data:
+            await update.message.reply_text(
+                f"🕒 <b>Turn Lookup</b>\n\n{target_mention} has no tasks assigned.",
+                parse_mode="HTML"
+            )
+            return
+
+        lines = []
+        for slot in slots.data:
+            task_id   = slot["task_id"]
+            task_seq  = slot["sequence_order"]
+            task_desc = html.escape(slot["dim_tasks"]["task_description"])
+
+            next_rid = peek_next_person_id(task_id)
+
+            if next_rid is None:
+                lines.append(f"• <b>{task_desc}</b>: no one scheduled right now")
+                continue
+
+            if next_rid == target_rid:
+                weekend = get_weekend_dates_from_week(week_str)
+                lines.append(f"• <b>{task_desc}</b>: 🔔 this weekend! ({weekend})")
+                continue
+
+            next_cfg = (
+                supabase.table("rotation_config").select("sequence_order")
+                .eq("roommate_id", next_rid).eq("task_id", task_id).execute()
+            )
+            if not next_cfg.data:
+                lines.append(f"• <b>{task_desc}</b>: schedule unavailable")
+                continue
+
+            next_seq     = next_cfg.data[0]["sequence_order"]
+            skip_banked  = (target.get("skip_turn_count") or 0)
+            raw_steps    = (task_seq - next_seq) % 5 or 5
+            steps        = raw_steps + skip_banked * 5
+            target_week  = (datetime.now() + timedelta(weeks=steps)).strftime("%Y-W%V")
+            dates        = get_weekend_dates_from_week(target_week)
+            week_word    = "week" if steps == 1 else "weeks"
+            lines.append(f"• <b>{task_desc}</b>: in {steps} {week_word} ({dates})")
+
+        await update.message.reply_text(
+            f"🕒 <b>Turn Lookup</b>\n\n{target_mention}\n\n" + "\n".join(lines),
+            parse_mode="HTML"
+        )
+
+    except Exception as e:
+        _err("handle_myturn", e)
+        log_to_db("ERROR", "handle_myturn failed", error_details=traceback.format_exc())
         await update.message.reply_text(
             "⚠️ Something went wrong — check the terminal for the full error.", parse_mode="HTML"
         )
@@ -545,6 +672,7 @@ async def handle_help(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
         "• done — Log your clean for this week\n"
         "• /volunteer — Bonus clean + earn a skip pass\n"
         "• /next — Upcoming schedule (both tracks)\n"
+        "• /myturn — Your turn countdown (or /myturn @name)\n"
         "• /last — 3 most recent log entries\n\n"
         "<b>Your Status</b>\n"
         "• /status — Everyone's state + last cleaned\n"
@@ -683,6 +811,7 @@ async def handle_deletelast(update: Update, _context: ContextTypes.DEFAULT_TYPE)
             f"• Log ID: #{log_id}\n"
             f"• By: {name}\n"
             f"• Task: {task}\n"
+            f"• Week: <code>{week}</code>\n"
             f"• Date: {date_fmt}  ({get_weekend_dates_from_week(week)})",
             parse_mode="HTML"
         )
@@ -695,8 +824,23 @@ async def handle_deletelast(update: Update, _context: ContextTypes.DEFAULT_TYPE)
         )
 
 
+async def _log_private_interaction(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.from_user or not update.message.text:
+        return
+    user    = update.message.from_user
+    name    = user.first_name or user.username or "Unknown"
+    command = update.message.text.strip().split()[0]
+    log_interaction(user.id, name, command)
+
+
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).build()
+
+    # Log every private text message before dispatching — runs in group=-1 ahead of all handlers
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, _log_private_interaction),
+        group=-1
+    )
 
     # Accept 'done' from private DMs and from the group — handled differently inside the handler
     done_filter = (filters.ChatType.PRIVATE | filters.Chat(chat_id=GROUP_ID)) & filters.Regex(r"(?i)^\s*done\s*$")
@@ -707,6 +851,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("status",     get_status))
     app.add_handler(CommandHandler("next",       handle_next))
     app.add_handler(CommandHandler("last",       handle_last))
+    app.add_handler(CommandHandler("myturn",     handle_myturn))
     app.add_handler(CommandHandler("vacation",   set_vacation))
     app.add_handler(CommandHandler("skip",       handle_skip))
     app.add_handler(CommandHandler("back",       set_back))
