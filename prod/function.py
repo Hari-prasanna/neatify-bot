@@ -21,13 +21,13 @@ from telegram.request import HTTPXRequest
 try:
     from src.utils import (
         supabase, get_current_week, get_weekend_dates_from_week,
-        log_to_db, find_next_person, peek_next_person_id, mention_user,
+        log_to_db, log_interaction, find_next_person, peek_next_person_id, mention_user,
     )
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from src.utils import (
         supabase, get_current_week, get_weekend_dates_from_week,
-        log_to_db, find_next_person, peek_next_person_id, mention_user,
+        log_to_db, log_interaction, find_next_person, peek_next_person_id, mention_user,
     )
 
 logger = logging.getLogger()
@@ -86,6 +86,10 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
     is_private = update.message.chat.type == "private"
     week_str   = get_current_week()
 
+    # Record every private DM for engagement analytics
+    if is_private:
+        log_interaction(user_id, user_name, raw_text.split()[0] if raw_text else "(empty)")
+
     # /hi — works everywhere (needed for group registration flow)
     if text == "/hi":
         name = html.escape(user_name)
@@ -141,6 +145,7 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
             "• done — Log your clean for this week\n"
             "• /volunteer — Bonus clean + earn a skip pass\n"
             "• /next — Upcoming schedule (both tracks)\n"
+            "• /myturn — Your turn countdown (or /myturn @name)\n"
             "• /last — 3 most recent log entries\n\n"
             "<b>Your Status</b>\n"
             "• /status — Everyone's state + last cleaned\n"
@@ -204,10 +209,10 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
                 f"• 📆 Weekend: {current_dates}"
             )
 
-            # Personal section — fetch full caller data so mention_user works
+            # Personal section — fetch full caller data including banked skips
             try:
                 caller_res = supabase.table("dim_roommates").select(
-                    "roommate_id, name, telegram_id, telegram_username"
+                    "roommate_id, name, telegram_id, telegram_username, skip_turn_count"
                 ).eq("telegram_id", user_id).execute()
 
                 if caller_res.data:
@@ -234,7 +239,10 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
                                     f"{current_dates} (this weekend!)"
                                 )
                             elif not is_priority:
-                                steps = (caller_seq - track_next["sequence_order"]) % 5 or 5
+                                # Each banked skip shifts the turn one full cycle (5 weeks) later
+                                skip_banked  = (caller.get("skip_turn_count") or 0)
+                                raw_steps    = (caller_seq - track_next["sequence_order"]) % 5 or 5
+                                steps        = raw_steps + skip_banked * 5
                                 target_week  = (
                                     datetime.now() + timedelta(weeks=steps)
                                 ).strftime("%Y-W%V")
@@ -282,6 +290,111 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
             log_to_db("ERROR", "handle_last failed", error_details=traceback.format_exc())
             msg = "⚠️ Something went wrong. Check CloudWatch logs."
         await bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+        return {"statusCode": 200}
+
+    # /myturn — DM only
+    if text == "/myturn" or text.startswith("/myturn "):
+        if not is_private:
+            await bot.send_message(chat_id=chat_id, text=_GROUP_WARN, parse_mode="HTML")
+            return {"statusCode": 200}
+
+        # Use raw_text to preserve original @Username casing
+        myturn_args = raw_text.split()[1:]
+
+        try:
+            if myturn_args:
+                target_username = myturn_args[0].lstrip("@")
+                target_res = supabase.table("dim_roommates").select(
+                    "roommate_id, name, telegram_id, telegram_username, skip_turn_count"
+                ).ilike("telegram_username", target_username).execute()
+                if not target_res.data:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"🕒 <b>Turn Lookup</b>\n\n"
+                            f"❌ No user found with username @{html.escape(target_username)}.\n"
+                            f"Make sure they've sent /hi so their @username is registered."
+                        ),
+                        parse_mode="HTML"
+                    )
+                    return {"statusCode": 200}
+                target = target_res.data[0]
+            else:
+                target_res = supabase.table("dim_roommates").select(
+                    "roommate_id, name, telegram_id, telegram_username, skip_turn_count"
+                ).eq("telegram_id", user_id).execute()
+                if not target_res.data:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text="🕒 <b>Turn Lookup</b>\n\n❌ Not registered. Send /hi first.",
+                        parse_mode="HTML"
+                    )
+                    return {"statusCode": 200}
+                target = target_res.data[0]
+
+            target_rid     = target["roommate_id"]
+            target_mention = mention_user(target)
+
+            slots = (
+                supabase.table("rotation_config")
+                .select("task_id, sequence_order, dim_tasks(task_description)")
+                .eq("roommate_id", target_rid).execute()
+            )
+            if not slots.data:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🕒 <b>Turn Lookup</b>\n\n{target_mention} has no tasks assigned.",
+                    parse_mode="HTML"
+                )
+                return {"statusCode": 200}
+
+            lines = []
+            for slot in slots.data:
+                slot_task_id  = slot["task_id"]
+                slot_task_seq = slot["sequence_order"]
+                slot_desc     = html.escape(slot["dim_tasks"]["task_description"])
+
+                next_rid = peek_next_person_id(slot_task_id)
+
+                if next_rid is None:
+                    lines.append(f"• <b>{slot_desc}</b>: no one scheduled right now")
+                    continue
+
+                if next_rid == target_rid:
+                    weekend = get_weekend_dates_from_week(week_str)
+                    lines.append(f"• <b>{slot_desc}</b>: 🔔 this weekend! ({weekend})")
+                    continue
+
+                next_cfg = (
+                    supabase.table("rotation_config").select("sequence_order")
+                    .eq("roommate_id", next_rid).eq("task_id", slot_task_id).execute()
+                )
+                if not next_cfg.data:
+                    lines.append(f"• <b>{slot_desc}</b>: schedule unavailable")
+                    continue
+
+                next_seq     = next_cfg.data[0]["sequence_order"]
+                skip_banked  = (target.get("skip_turn_count") or 0)
+                raw_steps    = (slot_task_seq - next_seq) % 5 or 5
+                steps        = raw_steps + skip_banked * 5
+                target_week  = (datetime.now() + timedelta(weeks=steps)).strftime("%Y-W%V")
+                dates        = get_weekend_dates_from_week(target_week)
+                week_word    = "week" if steps == 1 else "weeks"
+                lines.append(f"• <b>{slot_desc}</b>: in {steps} {week_word} ({dates})")
+
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"🕒 <b>Turn Lookup</b>\n\n{target_mention}\n\n" + "\n".join(lines),
+                parse_mode="HTML"
+            )
+
+        except Exception:
+            log_to_db("ERROR", "handle_myturn failed", error_details=traceback.format_exc())
+            await bot.send_message(
+                chat_id=chat_id,
+                text="⚠️ Something went wrong. Check CloudWatch logs.",
+                parse_mode="HTML"
+            )
         return {"statusCode": 200}
 
     # /vacation — DM only
@@ -378,20 +491,34 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
                     .eq("roommate_id", roomie["roommate_id"]).limit(1).execute()
                 )
                 vol_task_id = cfg_res.data[0]["task_id"] if cfg_res.data else TASK_ENTIRE_HOME
+
+                # Who is currently scheduled? Store them so priority can be handed back after done.
+                replacing_rid = peek_next_person_id(vol_task_id)
+                if replacing_rid == roomie["roommate_id"]:
+                    replacing_rid = None  # Volunteer IS the scheduled person — no hand-off needed
+
                 supabase.table("fct_cleaning_logs").insert({
                     "roommate_id": roomie["roommate_id"], "task_id": vol_task_id,
                     "week_number": week_str, "is_volunteer": True,
                 }).execute()
+                new_skip_count = (roomie.get("skip_turn_count") or 0) + 1
                 supabase.table("dim_roommates").update({
-                    "skip_next_turn": True, "skip_next_turn_task_id": vol_task_id,
+                    "skip_turn_count":        new_skip_count,
+                    "skip_next_turn_task_id": vol_task_id,
+                    "is_priority_next":       True,
+                    "volunteer_replacing_id": replacing_rid,
                 }).eq("roommate_id", roomie["roommate_id"]).execute()
-                log_to_db("INFO", f"Volunteer + skip_next_turn(task={vol_task_id}) set for {roomie['name']}")
+                log_to_db("INFO",
+                          f"Volunteer: skip_turn_count → {new_skip_count} (task={vol_task_id}) "
+                          f"for {roomie['name']}, replacing_rid={replacing_rid}")
+                skip_word  = "skip pass" if new_skip_count == 1 else f"{new_skip_count} skip passes"
+                skip_turns = "next turn" if new_skip_count == 1 else f"next {new_skip_count} turns"
                 msg = (
                     f"🌟 <b>Volunteer Clean Logged</b>\n\n"
                     f"✅ Extra clean recorded!\n"
                     f"• By: {mention_user(roomie)}\n"
                     f"• Weekend: {get_weekend_dates_from_week(week_str)}\n\n"
-                    f"🎟️ Skip pass granted — next scheduled turn is waived."
+                    f"🎟️ {skip_word} banked — {skip_turns} waived."
                 )
         except Exception:
             log_to_db("ERROR", "handle_volunteer failed", error_details=traceback.format_exc())
@@ -516,6 +643,7 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
                     f"• Log ID: #{log_id}\n"
                     f"• By: {name}\n"
                     f"• Task: {task}\n"
+                    f"• Week: <code>{week}</code>\n"
                     f"• Date: {date_fmt}  ({get_weekend_dates_from_week(week)})"
                 )
         except Exception:
@@ -577,7 +705,7 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
             task_desc  = html.escape(task["dim_tasks"]["task_description"])
             caller_seq = task["sequence_order"]
 
-            # Turn guard: read-only check, does NOT consume skip_next_turn flags.
+            # Turn guard: read-only check, does NOT decrement skip_turn_count.
             expected_rid = peek_next_person_id(task_id)
             if expected_rid is not None and expected_rid != roomie_id:
                 block_msg = "🧹 <b>Clean Log</b>\n\n⚠️ It's not your turn yet!\n"
@@ -597,15 +725,28 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
                 await bot.send_message(chat_id=chat_id, text=block_msg, parse_mode="HTML")
                 return {"statusCode": 200}
 
+            # Capture volunteer state before clearing — needed to pass priority to replaced person
+            is_volunteer_priority = bool(roomie.get("is_priority_next")) and bool(roomie.get("volunteer_replacing_id"))
+            replacing_rid         = roomie.get("volunteer_replacing_id")
+
             supabase.table("fct_cleaning_logs").insert({
                 "roommate_id": roomie_id, "task_id": task_id, "week_number": week_str,
             }).execute()
             log_to_db("INFO", f"Clean logged: {roomie['name']} / {task_desc} / {week_str}")
 
-            # Consume priority pass — one-time use
-            supabase.table("dim_roommates").update({"is_priority_next": False}).eq(
-                "roommate_id", roomie_id
-            ).execute()
+            # Consume priority pass — one-time use; clear replacing pointer too
+            supabase.table("dim_roommates").update({
+                "is_priority_next":       False,
+                "volunteer_replacing_id": None,
+            }).eq("roommate_id", roomie_id).execute()
+
+            # If this was a volunteer doing their donated clean, restore priority to the original person
+            if is_volunteer_priority and replacing_rid:
+                supabase.table("dim_roommates").update({"is_priority_next": True}).eq(
+                    "roommate_id", replacing_rid
+                ).execute()
+                log_to_db("INFO",
+                          f"Priority passed to roommate_id={replacing_rid} after volunteer done ({roomie['name']})")
 
             next_config = find_next_person(task_id)
             next_handle = mention_user(next_config["dim_roommates"]) if next_config else "No one available"
@@ -613,11 +754,12 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
 
             if is_private:
                 # DM: send private confirmation, then broadcast to the group
+                vol_line    = "\n🎟️ Volunteer logged — your banked skip still applies." if is_volunteer_priority else ""
                 private_msg = (
                     f"🧹 <b>Clean Logged</b>\n\n"
                     f"✅ Logged!\n"
                     f"• Task: {task_desc}\n"
-                    f"• Weekend: {weekend}\n\n"
+                    f"• Weekend: {weekend}{vol_line}\n\n"
                     f"🔔 Next ({task_desc}): {next_handle}"
                 )
                 broadcast_msg = (

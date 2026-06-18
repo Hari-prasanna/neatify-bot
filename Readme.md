@@ -1,107 +1,159 @@
 # Neatify Cleaning Bot
 
-Telegram bot managing a weekly cleaning rotation for a shared house with:
-- Local polling backend (`[dev/main.py](dev/main.py)`)
-- Serverless AWS Lambda webhook (`[prod/function.py](prod/function.py)`)
-- Shared rotation engine in `[src/utils.py](src/utils.py)`
+Telegram bot managing a weekly cleaning rotation for a shared house.
 
-## Local development (DEV)
+- Local polling backend — [dev/main.py](dev/main.py)
+- Serverless AWS Lambda webhook — [prod/function.py](prod/function.py)
+- Shared rotation engine — [src/utils.py](src/utils.py)
+
+---
+
+## Local Development (DEV)
 
 ### Prerequisites
 
-- Python 3.13 installed.
-- Active Supabase project.
+- Python 3.13+
+- Active Supabase project
 
 ### 1) Configure environment
 
-Update `[.env](.env)` with valid values (copy from `[.env.example](.env.example)`):
+Copy the example file and fill in your credentials:
 
-- `TELEGRAM_TOKEN`
-- `TELEGRAM_GROUP_ID`
-- `SUPABASE_URL`
-- `SUPABASE_KEY`
-- `ADMIN_TELEGRAM_ID`
+```bash
+cp .env.example .env
+```
+
+Required values in `.env`:
+
+| Variable | Description |
+|---|---|
+| `TELEGRAM_TOKEN` | Bot token from @BotFather |
+| `TELEGRAM_GROUP_ID` | Numeric ID of the house group chat |
+| `ADMIN_TELEGRAM_ID` | Your personal Telegram numeric ID |
+| `SUPABASE_URL` | Supabase project URL |
+| `SUPABASE_KEY` | Supabase anon key |
 
 ### 2) Initialize database
 
-Execute `[database/schema.sql](database/schema.sql)` in your Supabase SQL Editor.
-Bootstrap the core tasks:
+Run [database/schema.sql](database/schema.sql) once in the Supabase SQL Editor, then seed the two task types:
 
 ```sql
 INSERT INTO dim_tasks (task_description) VALUES ('Entire Home'), ('Bathroom');
 ```
 
-### 3) Build and start services
-
-Install dependencies and run the local polling instance:
+### 3) Start the bot
 
 ```bash
 pip install -r dev/requirements.txt
 python dev/main.py
 ```
 
-### 4) Useful operations
+Stop with `Ctrl + C`.
 
-Stop local polling (clean exit):
-```bash
-Ctrl + C
-```
+---
 
 ## Production Deploy (AWS)
 
 ### 1) Configure secrets
-Ensure GitHub Actions Secrets are populated:
-- `TELEGRAM_TOKEN`, `TELEGRAM_GROUP_ID`, `TELEGRAM_SECRET_TOKEN`
-- `ADMIN_TELEGRAM_ID`
-- `SUPABASE_URL`, `SUPABASE_KEY`
-- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+
+Populate all GitHub Actions Secrets before deploying:
+
+| Secret | Description |
+|---|---|
+| `TELEGRAM_TOKEN` | Bot token |
+| `TELEGRAM_GROUP_ID` | House group chat ID |
+| `TELEGRAM_SECRET_TOKEN` | Random string for webhook header verification |
+| `ADMIN_TELEGRAM_ID` | Admin's Telegram ID |
+| `SUPABASE_URL` | Supabase project URL |
+| `SUPABASE_KEY` | Supabase anon key |
+| `AWS_ACCESS_KEY_ID` | IAM user access key |
+| `AWS_SECRET_ACCESS_KEY` | IAM user secret |
 
 ### 2) Push to deploy
-Deployments are handled completely via CI/CD. Push to the target branch:
+
+All deployments are handled by CI/CD — no manual steps needed:
 
 ```bash
 git push origin dev
 ```
 
-This triggers `[.github/workflows/deploy.yml](.github/workflows/deploy.yml)` to:
-- Build the deployment container via AWS SAM.
-- Deploy the serverless stack (`prod/function.py`) to AWS Lambda.
-- Automatically wire the new API Gateway URL to the Telegram webhook.
+This triggers [.github/workflows/deploy.yml](.github/workflows/deploy.yml), which:
+1. Copies `src/` into `prod/` so Lambda can import shared utilities
+2. Builds the deployment package via AWS SAM (`prod/template.yml`)
+3. Deploys to AWS Lambda and registers the new API Gateway URL as the Telegram webhook
+
+---
 
 ## Commands and Roles
 
-- Commands are routed via Private DM to reduce group noise. The bot broadcasts to the group chat only upon task completion.
-- On first interaction, users must self-register:
-    - `POST /hi` (captures Telegram ID and @username automatically).
+All commands are handled via **private DM** to keep the group chat clean. The bot broadcasts to the group only when a clean is logged.
 
-- **Roommate role:**
-    - `done`: Log weekly task completion.
-    - `/next`: View upcoming global schedule and personal countdown.
-    - `/status`: View active/vacation states and last-cleaned dates.
-    - `/last`: View 3 most recent log entries.
-    - `/volunteer`: Log bonus clean and waive next scheduled turn.
-    - `/vacation` (or `/skip`): Freeze rotation placement.
-    - `/back`: Return to active rotation (grants priority pass for next turn).
+Users must register on first use: send `/hi` (captures Telegram ID and @username automatically).
 
-- **Admin role:**
-    - `/activate <tg_id> <order> <task_id>`: Activate user and assign rotation slot.
-    - `/deletelast`: Remove the newest cleaning log entry.
+### Roommate commands
 
-## Project layout
+| Command | What it does |
+|---|---|
+| `done` | Log your weekly clean — broadcasts to the group |
+| `/next` | View upcoming schedule for both tracks + your personal countdown |
+| `/myturn` | Your exact turn date, accounting for banked skips (or `/myturn @name`) |
+| `/status` | Everyone's active/vacation state and last cleaned date |
+| `/last` | 3 most recent log entries |
+| `/volunteer` | Log a bonus clean and bank a skip pass for your next scheduled turn |
+| `/vacation` | Pause your rotation slot (both tracks skip you) |
+| `/skip` | Alias for /vacation |
+| `/back` | Return from vacation — grants a priority pass for your next turn |
+| `/help` | Full command reference |
+| `/hi` | Register or refresh your Telegram ID and @username |
 
-- `[dev](dev)`: Local polling execution environment.
-- `[prod](prod)`: AWS Lambda webhook execution environment.
-- `[src](src)`: Core logic and shared helper modules.
-- `[src/utils.py](src/utils.py)`: Shared Supabase client, rotation engine, and structured logging.
-- `[src/reminder.py](src/reminder.py)`: Friday morning cron execution script.
-- `[database/schema.sql](database/schema.sql)`: Supabase DDL definitions.
-- `[aws-bot-iac](aws-bot-iac)`: AWS SAM infrastructure-as-code templates.
-- `[.github/workflows](.github/workflows)`: CI/CD deployment and cron pipelines.
+### Admin commands
+
+| Command | What it does |
+|---|---|
+| `/activate <tg_id> <order> <task_id>` | Activate a user and assign their rotation slot |
+| `/deletelast` | Remove the most recent log entry (undo a mistaken `done`) |
+
+---
+
+## Project Layout
+
+```
+roommate-cleaning-bot/
+├── dev/
+│   ├── main.py             ← Local polling bot — all command handlers
+│   └── requirements.txt
+│
+├── prod/
+│   ├── function.py         ← AWS Lambda webhook handler
+│   ├── template.yml        ← AWS SAM infrastructure definition
+│   └── requirements.txt
+│
+├── src/
+│   ├── utils.py            ← Supabase client, rotation engine, logging helpers
+│   ├── reminder.py         ← Friday cron reminder (GitHub Actions)
+│   └── requirements.txt    ← Used by the delivery.yml workflow
+│
+├── database/
+│   └── schema.sql          ← Run once in Supabase SQL Editor
+│
+├── assets/
+│   └── data-dict.md        ← Full column reference for all tables
+│
+├── .github/workflows/
+│   ├── deploy.yml          ← Push to dev branch → deploy to Lambda
+│   └── delivery.yml        ← Every Friday 07:00 UTC → send reminder
+│
+└── .env.example            ← Copy to .env and fill in secrets
+```
+
+---
 
 ## Notes
 
-- Keep secrets in `[.env](.env)` (do not commit).
-- Dual-track rotation (Entire Home vs. Bathroom) runs as independent queues; updating one track does not mutate the pointer of the other.
-- Data is stored in Supabase using ISO week formats (`YYYY-Www`); the presentation layer translates this to calendar weekend dates dynamically.
-- `prod/function.py` explicitly requires `HTTPXRequest` for Lambda cold-start compatibility.
-- Application failures are logged server-side directly to the `sys_logs` table in Supabase via `src/utils.py`.
+- **Never commit `.env`** — all secrets must stay local or in GitHub Secrets.
+- **Dual-track rotation:** Entire Home (task 1) and Bathroom (task 2) run as fully independent queues. Logging a clean on one track does not move the cursor on the other.
+- **Volunteer mechanic:** `/volunteer` logs a bonus clean, banks a skip pass, and gives the volunteer priority so they can immediately say `done`. After their done is logged, the originally scheduled person automatically receives the next priority pass.
+- **Turn display:** `/next` and `/myturn` factor in banked skip passes. Each skip shifts the displayed turn date forward by one full cycle (5 weeks).
+- **Week format:** Logs use ISO week strings (`YYYY-Www`). The bot converts these to human-readable weekend date ranges (`Sat DD Mon – Sun DD Mon`) in all messages.
+- **Lambda cold starts:** `prod/function.py` uses `HTTPXRequest` — required because Lambda has no running event loop at import time.
+- **Error logging:** All failures write to the `sys_logs` table in Supabase. In dev, errors are also printed to the terminal with a full traceback. In prod, check CloudWatch.
