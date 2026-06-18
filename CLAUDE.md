@@ -43,9 +43,10 @@ Set in `.env` locally and in GitHub Actions Secrets for prod.
 |---|---|
 | `dim_tasks` | task catalog — task_id=1 Entire Home, task_id=2 Bathroom |
 | `dim_roommates` | people + state flags |
-| `rotation_config` | who is in which slot (sequence_order 1–5) for which task_id |
+| `rotation_config` | who is in which slot (sequence_order 1–N) for which task_id |
 | `fct_cleaning_logs` | every completed clean |
 | `sys_logs` | written by log_to_db() — errors and key events |
+| `interaction_logs` | every private DM received — usage analytics |
 
 Key columns in `dim_roommates`:
 
@@ -53,24 +54,53 @@ Key columns in `dim_roommates`:
 |---|---|
 | `telegram_id` | captured by /hi — used to look up sender |
 | `telegram_username` | captured by /hi — used for @mention |
-| `is_on_vacation` | both tracks skip this person |
-| `skip_next_turn` | set by /volunteer — consumed by find_next_person(), one-time |
-| `is_priority_next` | set by /back — person jumps queue, cleared when they say done |
+| `is_on_vacation` | set by /vacation or /skip; both tracks skip this person |
+| `skip_turn_count` | integer banked skips earned by /volunteer; decremented by the rotation walk when stepping over this person |
+| `skip_next_turn_task_id` | which task track the skip applies to (NULL = both); set alongside skip_turn_count |
+| `is_priority_next` | set by /back or /volunteer; person jumps queue; cleared when they say done |
+| `volunteer_replacing_id` | FK to dim_roommates; set by /volunteer to remember who was displaced; after volunteer says done, that person gets is_priority_next=TRUE; then cleared to NULL |
+
+Note: `skip_next_turn` (old boolean) is deprecated — ignore it. The live field is `skip_turn_count`.
 
 ---
 
-## Rotation Logic (`find_next_person(task_id)` in src/utils.py)
+## Rotation Logic
+
+### `find_next_person(task_id)` — stateful (call only when about to log a clean)
 
 Three layers, evaluated in order:
 
-1. **Priority override** — anyone with `is_priority_next=True` gets returned immediately.
+1. **Priority override** — anyone with `is_priority_next=True` is returned immediately.
 2. **Cursor** — read last non-volunteer log for this `task_id` → get their `sequence_order`.
-3. **Circular walk** — step forward (`order % 5 + 1`, max 10 steps):
+3. **Circular walk** — step forward through `rotation_config` (ordered by `sequence_order`):
    - Skip if `is_on_vacation`
-   - Skip if `skip_next_turn` (clear the flag immediately on skip)
+   - Skip if `roommate_id` is in `done_this_week` (non-vol log already exists this week)
+   - Skip if `skip_turn_count > 0` — decrement the count and move on (stateful)
    - Return the first eligible person
 
-Task 1 and Task 2 are **fully independent** — each has its own logs, its own cursor, same slot numbers.
+Task 1 and Task 2 are **fully independent** — each has its own logs, its own cursor.
+
+### `peek_next_person_id(task_id)` — read-only, same walk without decrementing
+
+Used as the **turn guard** before accepting "done". Same three-layer logic but never writes to DB.
+
+### `peek_next_n_persons(task_id, n=3)` — read-only, returns list of N upcoming cleaners
+
+Used by `/next` to show the next 3 upcoming turns. Simulates skip_turn_count locally without writing. Returns a list of `dim_roommates` dicts; list index = week offset from now.
+
+### `compute_turn_offset(caller_rid, caller_skip, next_rid, task_id)` — turn countdown
+
+Walks the actual rotation list (not a fixed-5 ring) to count how many weeks until the caller's turn. Accounts for intermediate skips (they don't consume a week), vacation skips, and the caller's own banked skips. Called by `/next` and `/myturn`.
+
+---
+
+## Key Behavioural Rules
+
+- **`/next` is fully read-only** — calls `peek_next_n_persons`, never `find_next_person`. Checking the schedule cannot consume skip counts.
+- **`/volunteer`** logs an `is_volunteer=TRUE` entry, increments `skip_turn_count`, sets `is_priority_next=TRUE` on the volunteer, and records `volunteer_replacing_id` (who they displaced).
+- **After volunteer says done** — volunteer's flags are cleared, then `is_priority_next=TRUE` is set on the person stored in `volunteer_replacing_id`. This ensures the original scheduled person is never permanently skipped.
+- **`done_this_week` guard** — both rotation functions pre-fetch non-volunteer log roommate_ids for current week + task before the walk. Prevents a cursor regression after `/deletelast` from re-selecting someone who already cleaned.
+- **Friday reminder** sends two messages: (1) group broadcast (fatal if fails), (2) private DM to the scheduled person's `telegram_id` (non-fatal if fails or NULL). Skips entirely if the person already has a done log this week.
 
 ---
 
@@ -92,7 +122,7 @@ Always send with `parse_mode="HTML"`.
 
 **prod/function.py** — no stdout prints (Lambda stdout goes to CloudWatch). Uses `log_to_db` only.
 
-**src/utils.py** — inline `print()` before each `log_to_db("ERROR", ...)` in `find_next_person`. Visible in dev terminal and CloudWatch in prod.
+**src/utils.py** — inline `print()` before each `log_to_db("ERROR", ...)` in rotation functions. Visible in dev terminal and CloudWatch in prod.
 
 ---
 
@@ -120,20 +150,32 @@ except ImportError:
    /activate <tg_id> <slot> 2    ← Bathroom track
 ```
 
-Slots 1–5 are independent per `task_id`. Same slot number can appear in both tracks.
+Slots are independent per `task_id`. Same slot number can appear in both tracks.
 
 ---
 
 ## DB Migrations (run in Supabase SQL editor if schema already exists)
 
 ```sql
-ALTER TABLE dim_roommates ADD COLUMN IF NOT EXISTS telegram_username TEXT;
-ALTER TABLE dim_roommates ADD COLUMN IF NOT EXISTS skip_next_turn    BOOLEAN DEFAULT FALSE;
-ALTER TABLE dim_roommates ADD COLUMN IF NOT EXISTS is_priority_next  BOOLEAN DEFAULT FALSE;
+ALTER TABLE dim_roommates ADD COLUMN IF NOT EXISTS telegram_username       TEXT;
+ALTER TABLE dim_roommates ADD COLUMN IF NOT EXISTS skip_next_turn          BOOLEAN DEFAULT FALSE;
+ALTER TABLE dim_roommates ADD COLUMN IF NOT EXISTS is_priority_next        BOOLEAN DEFAULT FALSE;
+ALTER TABLE dim_roommates ADD COLUMN IF NOT EXISTS skip_turn_count         INTEGER DEFAULT 0;
+ALTER TABLE dim_roommates ADD COLUMN IF NOT EXISTS skip_next_turn_task_id  INTEGER REFERENCES dim_tasks(task_id);
+ALTER TABLE dim_roommates ADD COLUMN IF NOT EXISTS volunteer_replacing_id  INTEGER REFERENCES dim_roommates(roommate_id);
 
 ALTER TABLE rotation_config DROP CONSTRAINT IF EXISTS rotation_config_sequence_order_key;
 ALTER TABLE rotation_config ADD CONSTRAINT rotation_config_sequence_task_unique
     UNIQUE (sequence_order, task_id);
+
+CREATE TABLE IF NOT EXISTS interaction_logs (
+    interaction_id SERIAL PRIMARY KEY,
+    created_at     TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    telegram_id    BIGINT NOT NULL,
+    name           TEXT   NOT NULL,
+    command        TEXT   NOT NULL,
+    environment    TEXT   NOT NULL
+);
 ```
 
 ---
@@ -147,8 +189,10 @@ ALTER TABLE rotation_config ADD CONSTRAINT rotation_config_sequence_task_unique
 | `/next` shows "No one scheduled" | `rotation_config` empty for that task_id, or all on vacation | Check `rotation_config` rows; check vacation flags |
 | Lambda returns 403 | `TELEGRAM_SECRET_TOKEN` mismatch | Re-deploy to re-register webhook |
 | "No task assigned" on done | Person has no `rotation_config` row | Run `/activate` for them |
-| Priority person stuck in queue | Someone ran `/back` but never said done | `UPDATE dim_roommates SET is_priority_next=FALSE WHERE name='X'` |
-| Reminder sends wrong person | Bathroom log moved the Entire Home cursor | Shouldn't happen — `find_next_person` filters by `task_id`. Check logs |
+| Priority person stuck in queue | Someone ran `/back` or `/volunteer` but never said done | `UPDATE dim_roommates SET is_priority_next=FALSE, volunteer_replacing_id=NULL WHERE name='X'` |
+| Reminder sends wrong person | Bug in rotation walk | Check `sys_logs` for errors; `find_next_person` filters by `task_id` |
+| Volunteer's skip not clearing | `skip_turn_count` not decremented | Check walk logic in `find_next_person`; confirm `rotation_config` row exists |
+| Turn count shows wrong weeks | Old `% 5` formula used instead of `compute_turn_offset` | Ensure both `/next` and `/myturn` use `compute_turn_offset()` |
 
 ---
 

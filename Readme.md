@@ -95,7 +95,7 @@ Users must register on first use: send `/hi` (captures Telegram ID and @username
 | Command | What it does |
 |---|---|
 | `done` | Log your weekly clean — broadcasts to the group |
-| `/next` | View upcoming schedule for both tracks + your personal countdown |
+| `/next` | View the next 3 upcoming turns for both tracks + your personal countdown |
 | `/myturn` | Your exact turn date, accounting for banked skips (or `/myturn @name`) |
 | `/status` | Everyone's active/vacation state and last cleaned date |
 | `/last` | 3 most recent log entries |
@@ -153,7 +153,7 @@ roommate-cleaning-bot/
 - **Never commit `.env`** — all secrets must stay local or in GitHub Secrets.
 - **Dual-track rotation:** Entire Home (task 1) and Bathroom (task 2) run as fully independent queues. Logging a clean on one track does not move the cursor on the other.
 - **Volunteer mechanic:** `/volunteer` logs a bonus clean, banks a skip pass, and gives the volunteer priority so they can immediately say `done`. After their done is logged, the originally scheduled person automatically receives the next priority pass.
-- **Turn display:** `/next` and `/myturn` factor in banked skip passes. Each skip shifts the displayed turn date forward by one full cycle (5 weeks).
+- **Turn display:** `/next` shows the next 3 upcoming turns per track (read-only — checking the schedule never consumes skip passes). `/myturn` shows your exact date. Both factor in banked skips using the actual rotation length, not a fixed-5 formula.
 - **Week format:** Logs use ISO week strings (`YYYY-Www`). The bot converts these to human-readable weekend date ranges (`Sat DD Mon – Sun DD Mon`) in all messages.
 - **Lambda cold starts:** `prod/function.py` uses `HTTPXRequest` — required because Lambda has no running event loop at import time.
 - **Error logging:** All failures write to the `sys_logs` table in Supabase. In dev, errors are also printed to the terminal with a full traceback. In prod, check CloudWatch.

@@ -143,6 +143,132 @@ def compute_turn_offset(caller_rid: int, caller_skip: int, next_rid: int, task_i
         return 1
 
 
+def peek_next_n_persons(task_id: int, n: int = 3) -> list[dict]:
+    """
+    Returns the next N upcoming cleaners for task_id in rotation order.
+    Fully read-only — skip_turn_count is simulated locally, never written.
+    List index = week offset from now (0 = this week, 1 = next, 2 = week after).
+    """
+    results: list[dict] = []
+    try:
+        slots_res = (
+            supabase.table("rotation_config")
+            .select("sequence_order, roommate_id, "
+                    "dim_roommates(roommate_id, name, telegram_id, telegram_username, "
+                    "is_on_vacation, skip_turn_count)")
+            .eq("task_id", task_id).order("sequence_order")
+            .execute()
+        )
+        all_slots = slots_res.data
+        if not all_slots:
+            return []
+
+        n_slots    = len(all_slots)
+        local_skip = {
+            s["roommate_id"]: (s["dim_roommates"].get("skip_turn_count") or 0)
+            for s in all_slots
+        }
+
+        # Skipped done_this_week only for the first slot (current week)
+        done_this_week: set = set()
+        try:
+            done_res = (
+                supabase.table("fct_cleaning_logs").select("roommate_id")
+                .eq("week_number", get_current_week()).eq("is_volunteer", False)
+                .eq("task_id", task_id).execute()
+            )
+            done_this_week = {r["roommate_id"] for r in done_res.data}
+        except Exception:
+            pass
+
+        # Priority override — goes first regardless of cursor position
+        priority_rid: int | None = None
+        start_idx = 0
+        try:
+            pres = (
+                supabase.table("dim_roommates").select("roommate_id")
+                .eq("is_priority_next", True).eq("is_active", True).eq("is_on_vacation", False)
+                .execute()
+            )
+            if pres.data:
+                cfg = (
+                    supabase.table("rotation_config").select("roommate_id")
+                    .eq("roommate_id", pres.data[0]["roommate_id"]).eq("task_id", task_id)
+                    .execute()
+                )
+                if cfg.data:
+                    priority_rid = cfg.data[0]["roommate_id"]
+        except Exception:
+            pass
+
+        if priority_rid:
+            for i, s in enumerate(all_slots):
+                if s["roommate_id"] == priority_rid:
+                    results.append(s["dim_roommates"])
+                    start_idx     = i
+                    done_this_week = set()  # priority turn IS this week — clear filter
+                    break
+
+        if len(results) < n:
+            # Cursor from last non-volunteer log (only when no priority override)
+            if not priority_rid:
+                try:
+                    last = (
+                        supabase.table("fct_cleaning_logs").select("roommate_id")
+                        .eq("task_id", task_id).eq("is_volunteer", False)
+                        .order("cleaned_at", desc=True).limit(1).execute()
+                    )
+                    if last.data:
+                        oref = (
+                            supabase.table("rotation_config").select("sequence_order")
+                            .eq("roommate_id", last.data[0]["roommate_id"]).eq("task_id", task_id)
+                            .execute()
+                        )
+                        if oref.data:
+                            cursor_order = oref.data[0]["sequence_order"]
+                            for i, s in enumerate(all_slots):
+                                if s["sequence_order"] == cursor_order:
+                                    start_idx = i
+                                    break
+                except Exception:
+                    pass
+
+            first_found = bool(results)
+            cur_idx     = start_idx
+            max_steps   = n_slots * (n + max(local_skip.values(), default=0) + 2)
+
+            for _ in range(max_steps):
+                cur_idx = (cur_idx + 1) % n_slots
+                slot    = all_slots[cur_idx]
+                rid     = slot["roommate_id"]
+                person  = slot["dim_roommates"]
+
+                if person.get("is_on_vacation"):
+                    continue
+                if not first_found and rid in done_this_week:
+                    continue
+
+                skip = local_skip.get(rid, 0)
+                if skip > 0:
+                    local_skip[rid] = skip - 1
+                    continue
+                if priority_rid and rid == priority_rid:
+                    continue  # already in results[0]
+
+                results.append(person)
+                first_found    = True
+                done_this_week = set()
+
+                if len(results) >= n:
+                    break
+
+    except Exception as e:
+        log_to_db("ERROR", f"peek_next_n_persons failed (task_id={task_id})",
+                  error_details=str(e))
+
+    return results
+
+
 def peek_next_person_id(task_id: int) -> int | None:
     """
     Read-only turn check — returns roommate_id of who should clean next for task_id.
