@@ -9,7 +9,10 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.utils import supabase, get_current_week, log_to_db, find_next_person, mention_user
+from src.utils import (
+    supabase, get_current_week, get_weekend_dates_from_week,
+    log_to_db, find_next_person, mention_user,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("reminder")
@@ -34,16 +37,36 @@ def run_reminder() -> None:
         log_to_db("WARNING", msg)
         return
 
-    roomie = next_config["dim_roommates"]
-    task   = next_config["dim_tasks"]
-    handle = mention_user(roomie)
+    roomie  = next_config["dim_roommates"]
+    task    = next_config["dim_tasks"]
+    handle  = mention_user(roomie)
+    weekend = get_weekend_dates_from_week(week_str)
+
+    # Skip if this person already logged done for the current week
+    try:
+        done_check = (
+            supabase.table("fct_cleaning_logs").select("log_id")
+            .eq("roommate_id", next_config["roommate_id"])
+            .eq("task_id", ENTIRE_HOME_TASK_ID)
+            .eq("week_number", week_str)
+            .eq("is_volunteer", False)
+            .execute()
+        )
+        if done_check.data:
+            info = f"Friday reminder skipped — {roomie['name']} already logged done for {week_str}."
+            logger.info(info)
+            log_to_db("INFO", info)
+            return
+    except Exception as e:
+        log_to_db("WARNING", f"Friday reminder done-check failed: {e}")
 
     message = (
         f"🧹 <b>Friday Reminder</b>\n\n"
         f"• Week: <code>{week_str}</code>\n"
+        f"• Dates: {weekend}\n"
         f"• Task: {task['task_description']}\n"
         f"• On deck: {handle}\n\n"
-        f"Reply <b>done</b> in the group when finished! 🙌"
+        f"📱 Send <b>done</b> as a private message to the bot when finished!"
     )
 
     telegram_url = f"https://api.telegram.org/bot{token}/sendMessage"

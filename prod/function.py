@@ -21,13 +21,15 @@ from telegram.request import HTTPXRequest
 try:
     from src.utils import (
         supabase, get_current_week, get_weekend_dates_from_week,
-        log_to_db, log_interaction, find_next_person, peek_next_person_id, mention_user,
+        log_to_db, log_interaction, find_next_person, peek_next_person_id,
+        mention_user, compute_turn_offset,
     )
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from src.utils import (
         supabase, get_current_week, get_weekend_dates_from_week,
-        log_to_db, log_interaction, find_next_person, peek_next_person_id, mention_user,
+        log_to_db, log_interaction, find_next_person, peek_next_person_id,
+        mention_user, compute_turn_offset,
     )
 
 logger = logging.getLogger()
@@ -239,10 +241,10 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
                                     f"{current_dates} (this weekend!)"
                                 )
                             elif not is_priority:
-                                # Each banked skip shifts the turn one full cycle (5 weeks) later
-                                skip_banked  = (caller.get("skip_turn_count") or 0)
-                                raw_steps    = (caller_seq - track_next["sequence_order"]) % 5 or 5
-                                steps        = raw_steps + skip_banked * 5
+                                steps        = compute_turn_offset(
+                                    caller_rid, caller.get("skip_turn_count") or 0,
+                                    next_rid,   caller_task,
+                                )
                                 target_week  = (
                                     datetime.now() + timedelta(weeks=steps)
                                 ).strftime("%Y-W%V")
@@ -373,10 +375,10 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
                     lines.append(f"• <b>{slot_desc}</b>: schedule unavailable")
                     continue
 
-                next_seq     = next_cfg.data[0]["sequence_order"]
-                skip_banked  = (target.get("skip_turn_count") or 0)
-                raw_steps    = (slot_task_seq - next_seq) % 5 or 5
-                steps        = raw_steps + skip_banked * 5
+                steps        = compute_turn_offset(
+                    target_rid, target.get("skip_turn_count") or 0,
+                    next_rid,   slot_task_id,
+                )
                 target_week  = (datetime.now() + timedelta(weeks=steps)).strftime("%Y-W%V")
                 dates        = get_weekend_dates_from_week(target_week)
                 week_word    = "week" if steps == 1 else "weeks"

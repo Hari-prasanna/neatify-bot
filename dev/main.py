@@ -21,7 +21,8 @@ from telegram.ext import (
 )
 from src.utils import (
     supabase, BOT_ENV, get_current_week, get_weekend_dates_from_week,
-    log_to_db, log_interaction, find_next_person, peek_next_person_id, mention_user,
+    log_to_db, log_interaction, find_next_person, peek_next_person_id,
+    mention_user, compute_turn_offset,
 )
 
 logging.basicConfig(
@@ -310,10 +311,10 @@ async def handle_next(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
                         if caller_rid == next_rid:
                             msg += f"\n\n🔔 {caller_mention} — your turn: {current_dates} (this weekend!)"
                         elif not is_priority:
-                            # Each banked skip shifts the caller's turn one full cycle (5 weeks) later
-                            skip_banked  = (caller.get("skip_turn_count") or 0)
-                            raw_steps    = (caller_seq - track_next["sequence_order"]) % 5 or 5
-                            steps        = raw_steps + skip_banked * 5
+                            steps        = compute_turn_offset(
+                                caller_rid, caller.get("skip_turn_count") or 0,
+                                next_rid,   caller_task,
+                            )
                             target_week  = (datetime.now() + timedelta(weeks=steps)).strftime("%Y-W%V")
                             caller_dates = get_weekend_dates_from_week(target_week)
                             msg += (
@@ -638,10 +639,10 @@ async def handle_myturn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 lines.append(f"• <b>{task_desc}</b>: schedule unavailable")
                 continue
 
-            next_seq     = next_cfg.data[0]["sequence_order"]
-            skip_banked  = (target.get("skip_turn_count") or 0)
-            raw_steps    = (task_seq - next_seq) % 5 or 5
-            steps        = raw_steps + skip_banked * 5
+            steps        = compute_turn_offset(
+                target_rid, target.get("skip_turn_count") or 0,
+                next_rid,   task_id,
+            )
             target_week  = (datetime.now() + timedelta(weeks=steps)).strftime("%Y-W%V")
             dates        = get_weekend_dates_from_week(target_week)
             week_word    = "week" if steps == 1 else "weeks"
