@@ -91,6 +91,58 @@ def log_interaction(telegram_id: int, name: str, command: str) -> None:
         print(f"\n[log_interaction FAILED] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
 
 
+def compute_turn_offset(caller_rid: int, caller_skip: int, next_rid: int, task_id: int) -> int:
+    """
+    Returns how many weeks from now until caller_rid's turn, given next_rid cleans this week.
+
+    Walks the actual rotation order (not a fixed-5 ring) so the count is correct for any
+    group size. Intermediate people with banked skips are NOT counted as a week (they'll be
+    passed over). The caller's own banked skips each add (n-1) weeks, where n is the
+    number of people in the rotation.
+    Returns 1 on any error.
+    """
+    try:
+        res = (
+            supabase.table("rotation_config")
+            .select("roommate_id, dim_roommates(skip_turn_count, is_on_vacation)")
+            .eq("task_id", task_id).order("sequence_order")
+            .execute()
+        )
+        slots = res.data
+        n = len(slots)
+        if n == 0:
+            return 1
+
+        next_pos   = next((i for i, s in enumerate(slots) if s["roommate_id"] == next_rid), -1)
+        caller_pos = next((i for i, s in enumerate(slots) if s["roommate_id"] == caller_rid), -1)
+
+        if next_pos < 0 or caller_pos < 0 or next_pos == caller_pos:
+            return 1
+
+        # Walk forward from next, counting only slots that will actually clean
+        base = 0
+        idx  = (next_pos + 1) % n
+        for _ in range(n):
+            p           = slots[idx]["dim_roommates"]
+            on_vacation = p.get("is_on_vacation") or False
+            slot_skip   = p.get("skip_turn_count") or 0
+            is_caller   = (idx == caller_pos)
+
+            if not on_vacation:
+                # Count this slot if it's the caller OR it has no banked skip (it WILL clean)
+                if is_caller or slot_skip == 0:
+                    base += 1
+
+            if is_caller:
+                break
+            idx = (idx + 1) % n
+
+        # Each of the caller's own banked skips defers them one full cycle (n-1 other cleaners)
+        return base + caller_skip * max(1, n - 1)
+    except Exception:
+        return 1
+
+
 def peek_next_person_id(task_id: int) -> int | None:
     """
     Read-only turn check — returns roommate_id of who should clean next for task_id.
