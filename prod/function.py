@@ -708,26 +708,21 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
                 )
                 return {"statusCode": 200}
 
-            task       = config_res.data[0]
-            task_id    = task["task_id"]
-            task_desc  = html.escape(task["dim_tasks"]["task_description"])
-            caller_seq = task["sequence_order"]
+            task      = config_res.data[0]
+            task_id   = task["task_id"]
+            task_desc = html.escape(task["dim_tasks"]["task_description"])
 
             # Turn guard: read-only check, does NOT decrement skip_turn_count.
             expected_rid = peek_next_person_id(task_id)
             if expected_rid is not None and expected_rid != roomie_id:
                 block_msg = "🧹 <b>Clean Log</b>\n\n⚠️ It's not your turn yet!\n"
                 try:
-                    next_cfg = (
-                        supabase.table("rotation_config").select("sequence_order")
-                        .eq("roommate_id", expected_rid).eq("task_id", task_id)
-                        .execute()
+                    steps       = compute_turn_offset(
+                        roomie_id, roomie.get("skip_turn_count") or 0,
+                        expected_rid, task_id,
                     )
-                    if next_cfg.data:
-                        next_seq    = next_cfg.data[0]["sequence_order"]
-                        steps       = (caller_seq - next_seq) % 5 or 5
-                        target_week = (datetime.now() + timedelta(weeks=steps)).strftime("%Y-W%V")
-                        block_msg  += f"• Your next turn: {get_weekend_dates_from_week(target_week)}"
+                    target_week = (datetime.now() + timedelta(weeks=steps)).strftime("%Y-W%V")
+                    block_msg  += f"• Your next turn: {get_weekend_dates_from_week(target_week)}"
                 except Exception:
                     log_to_db("ERROR", "done turn-guard calc failed", error_details=traceback.format_exc())
                 await bot.send_message(chat_id=chat_id, text=block_msg, parse_mode="HTML")
@@ -756,9 +751,12 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
                 log_to_db("INFO",
                           f"Priority passed to roommate_id={replacing_rid} after volunteer done ({roomie['name']})")
 
-            next_config = find_next_person(task_id)
-            next_handle = mention_user(next_config["dim_roommates"]) if next_config else "No one available"
-            weekend     = get_weekend_dates_from_week(week_str)
+            next_config  = find_next_person(task_id)
+            next_handle  = mention_user(next_config["dim_roommates"]) if next_config else "No one available"
+            weekend      = get_weekend_dates_from_week(week_str)
+            next_weekend = get_weekend_dates_from_week(
+                (datetime.now() + timedelta(weeks=1)).strftime("%Y-W%V")
+            )
 
             if is_private:
                 # DM: send private confirmation, then broadcast to the group
@@ -773,7 +771,7 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
                 broadcast_msg = (
                     f"📢 <b>Cleaning Update</b>\n\n"
                     f"{mention_user(roomie)} has completed <b>{task_desc}</b>!\n"
-                    f"🔔 Next up: {next_handle} — {weekend}"
+                    f"🔔 Next up: {next_handle} — {next_weekend}"
                 )
                 await bot.send_message(chat_id=chat_id, text=private_msg, parse_mode="HTML")
                 await bot.send_message(chat_id=GROUP_ID, text=broadcast_msg, parse_mode="HTML")
