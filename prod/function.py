@@ -201,22 +201,41 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
             home_turns = peek_next_n_persons(TASK_ENTIRE_HOME, 3)
             bath_turns = peek_next_n_persons(TASK_BATHROOM, 3)
 
-            def _turns_section(turns: list[dict]) -> str:
+            # week_base: 0 if nobody has cleaned this week yet (result[0] = this weekend),
+            #            1 if someone already cleaned (result[0] = next weekend)
+            home_base = bath_base = 0
+            try:
+                if (supabase.table("fct_cleaning_logs").select("log_id")
+                        .eq("week_number", week_str).eq("is_volunteer", False)
+                        .eq("task_id", TASK_ENTIRE_HOME).execute()).data:
+                    home_base = 1
+                if (supabase.table("fct_cleaning_logs").select("log_id")
+                        .eq("week_number", week_str).eq("is_volunteer", False)
+                        .eq("task_id", TASK_BATHROOM).execute()).data:
+                    bath_base = 1
+            except Exception:
+                pass
+
+            def _turns_section(turns: list[dict], week_base: int) -> str:
                 if not turns:
                     return "• No one scheduled"
                 lines = []
                 for i, person in enumerate(turns):
                     handle = mention_user(person)
-                    w      = (datetime.now() + timedelta(weeks=i)).strftime("%Y-W%V")
+                    w      = (datetime.now() + timedelta(weeks=week_base + i)).strftime("%Y-W%V")
                     dates  = get_weekend_dates_from_week(w)
-                    prefix = f"• 🔔 {handle} — this weekend ({dates})" if i == 0 else f"• {handle} — {dates}"
+                    if i == 0:
+                        label  = "next weekend" if week_base == 1 else "this weekend"
+                        prefix = f"• 🔔 {handle} — {label} ({dates})"
+                    else:
+                        prefix = f"• {handle} — {dates}"
                     lines.append(prefix)
                 return "\n".join(lines)
 
             msg = (
                 f"📅 <b>Upcoming Schedule</b>\n\n"
-                f"🏠 <b>Entire Home</b>\n{_turns_section(home_turns)}\n\n"
-                f"🚿 <b>Bathroom</b>\n{_turns_section(bath_turns)}"
+                f"🏠 <b>Entire Home</b>\n{_turns_section(home_turns, home_base)}\n\n"
+                f"🚿 <b>Bathroom</b>\n{_turns_section(bath_turns, bath_base)}"
             )
 
             # Personal section — fetch caller's rotation slot and banked skips
@@ -226,31 +245,34 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
                 ).eq("telegram_id", user_id).execute()
 
                 if caller_res.data:
-                    caller         = caller_res.data[0]
-                    caller_rid     = caller["roommate_id"]
-                    caller_mention = mention_user(caller)
+                    caller          = caller_res.data[0]
+                    caller_rid      = caller["roommate_id"]
+                    caller_mention  = mention_user(caller)
 
                     caller_cfg = supabase.table("rotation_config").select(
                         "task_id"
                     ).eq("roommate_id", caller_rid).limit(1).execute()
 
                     if caller_cfg.data:
-                        caller_task = caller_cfg.data[0]["task_id"]
-                        track_turns = home_turns if caller_task == TASK_ENTIRE_HOME else bath_turns
+                        caller_task     = caller_cfg.data[0]["task_id"]
+                        track_turns     = home_turns if caller_task == TASK_ENTIRE_HOME else bath_turns
+                        track_week_base = home_base  if caller_task == TASK_ENTIRE_HOME else bath_base
 
                         if track_turns:
                             next_rid = track_turns[0]["roommate_id"]
                             if caller_rid == next_rid:
-                                current_dates = get_weekend_dates_from_week(week_str)
+                                target_wk    = (datetime.now() + timedelta(weeks=track_week_base)).strftime("%Y-W%V")
+                                caller_dates = get_weekend_dates_from_week(target_wk)
+                                label        = "next weekend" if track_week_base == 1 else "this weekend"
                                 msg += (
                                     f"\n\n🔔 {caller_mention} — your turn: "
-                                    f"{current_dates} (this weekend!)"
+                                    f"{caller_dates} ({label}!)"
                                 )
                             else:
                                 steps        = compute_turn_offset(
                                     caller_rid, caller.get("skip_turn_count") or 0,
                                     next_rid,   caller_task,
-                                )
+                                ) + track_week_base
                                 target_week  = (
                                     datetime.now() + timedelta(weeks=steps)
                                 ).strftime("%Y-W%V")
@@ -717,10 +739,16 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
             if expected_rid is not None and expected_rid != roomie_id:
                 block_msg = "🧹 <b>Clean Log</b>\n\n⚠️ It's not your turn yet!\n"
                 try:
+                    done_chk = (
+                        supabase.table("fct_cleaning_logs").select("log_id")
+                        .eq("week_number", week_str).eq("is_volunteer", False)
+                        .eq("task_id", task_id).execute()
+                    )
+                    week_base   = 1 if done_chk.data else 0
                     steps       = compute_turn_offset(
                         roomie_id, roomie.get("skip_turn_count") or 0,
                         expected_rid, task_id,
-                    )
+                    ) + week_base
                     target_week = (datetime.now() + timedelta(weeks=steps)).strftime("%Y-W%V")
                     block_msg  += f"• Your next turn: {get_weekend_dates_from_week(target_week)}"
                 except Exception:
