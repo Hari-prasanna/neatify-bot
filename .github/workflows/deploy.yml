@@ -42,12 +42,14 @@ jobs:
       - name: SAM Deploy
         env:
           T_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          T_GROUP: ${{ secrets.TELEGRAM_GROUP_ID }}
           T_SECRET: ${{ secrets.TELEGRAM_SECRET_TOKEN }}
           T_ADMIN: ${{ secrets.ADMIN_TELEGRAM_ID }}
           SB_URL: ${{ secrets.SUPABASE_URL }}
           SB_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
           PARAMS="TelegramToken=$T_TOKEN \
+            TelegramGroupId=$T_GROUP \
             AdminTelegramId=$T_ADMIN \
             SupabaseUrl=$SB_URL \
             SupabaseKey=$SB_KEY"
