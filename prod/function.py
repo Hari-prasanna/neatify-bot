@@ -380,9 +380,8 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
 
             lines = []
             for slot in slots.data:
-                slot_task_id  = slot["task_id"]
-                slot_task_seq = slot["sequence_order"]
-                slot_desc     = html.escape(slot["dim_tasks"]["task_description"])
+                slot_task_id = slot["task_id"]
+                slot_desc    = html.escape(slot["dim_tasks"]["task_description"])
 
                 next_rid = peek_next_person_id(slot_task_id)
 
@@ -390,26 +389,27 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
                     lines.append(f"• <b>{slot_desc}</b>: no one scheduled right now")
                     continue
 
-                if next_rid == target_rid:
-                    weekend = get_weekend_dates_from_week(week_str)
-                    lines.append(f"• <b>{slot_desc}</b>: 🔔 this weekend! ({weekend})")
-                    continue
-
-                next_cfg = (
-                    supabase.table("rotation_config").select("sequence_order")
-                    .eq("roommate_id", next_rid).eq("task_id", slot_task_id).execute()
+                done_chk = (
+                    supabase.table("fct_cleaning_logs").select("log_id")
+                    .eq("week_number", week_str).eq("is_volunteer", False)
+                    .eq("task_id", slot_task_id).execute()
                 )
-                if not next_cfg.data:
-                    lines.append(f"• <b>{slot_desc}</b>: schedule unavailable")
+                week_base = 1 if done_chk.data else 0
+
+                if next_rid == target_rid:
+                    target_wk = (datetime.now() + timedelta(weeks=week_base)).strftime("%Y-W%V")
+                    weekend   = get_weekend_dates_from_week(target_wk)
+                    label     = "next weekend" if week_base == 1 else "this weekend"
+                    lines.append(f"• <b>{slot_desc}</b>: 🔔 {label}! ({weekend})")
                     continue
 
-                steps        = compute_turn_offset(
+                steps       = compute_turn_offset(
                     target_rid, target.get("skip_turn_count") or 0,
                     next_rid,   slot_task_id,
-                )
-                target_week  = (datetime.now() + timedelta(weeks=steps)).strftime("%Y-W%V")
-                dates        = get_weekend_dates_from_week(target_week)
-                week_word    = "week" if steps == 1 else "weeks"
+                ) + week_base
+                target_week = (datetime.now() + timedelta(weeks=steps)).strftime("%Y-W%V")
+                dates       = get_weekend_dates_from_week(target_week)
+                week_word   = "week" if steps == 1 else "weeks"
                 lines.append(f"• <b>{slot_desc}</b>: in {steps} {week_word} ({dates})")
 
             await bot.send_message(
