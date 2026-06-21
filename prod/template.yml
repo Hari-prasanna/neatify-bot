@@ -10,6 +10,8 @@ Transform: AWS::Serverless-2016-10-31
 Parameters:
   TelegramToken:
     Type: String
+  TelegramGroupId:
+    Type: String
   TelegramSecretToken:
     Type: String
     Default: ""
@@ -34,6 +36,7 @@ Resources:
         Variables:
           BOT_ENV: prod
           TELEGRAM_TOKEN: !Ref TelegramToken
+          TELEGRAM_GROUP_ID: !Ref TelegramGroupId
           TELEGRAM_SECRET_TOKEN: !Ref TelegramSecretToken
           ADMIN_TELEGRAM_ID: !Ref AdminTelegramId
           SUPABASE_URL: !Ref SupabaseUrl

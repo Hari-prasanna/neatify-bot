@@ -21,14 +21,14 @@ from telegram.request import HTTPXRequest
 try:
     from src.utils import (
         supabase, get_current_week, get_weekend_dates_from_week,
-        log_to_db, log_interaction, find_next_person, peek_next_person_id,
+        log_to_db, log_interaction, peek_next_person_id, consume_skips_up_to,
         peek_next_n_persons, mention_user, compute_turn_offset,
     )
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from src.utils import (
         supabase, get_current_week, get_weekend_dates_from_week,
-        log_to_db, log_interaction, find_next_person, peek_next_person_id,
+        log_to_db, log_interaction, peek_next_person_id, consume_skips_up_to,
         peek_next_n_persons, mention_user, compute_turn_offset,
     )
 
@@ -751,8 +751,9 @@ async def process_update(event: dict, bot: telegram.Bot) -> dict:
                 log_to_db("INFO",
                           f"Priority passed to roommate_id={replacing_rid} after volunteer done ({roomie['name']})")
 
-            next_config  = find_next_person(task_id)
-            next_handle  = mention_user(next_config["dim_roommates"]) if next_config else "No one available"
+            consume_skips_up_to(task_id, roomie_id)
+            next_persons = peek_next_n_persons(task_id, 1)
+            next_handle  = mention_user(next_persons[0]) if next_persons else "No one available"
             weekend      = get_weekend_dates_from_week(week_str)
             next_weekend = get_weekend_dates_from_week(
                 (datetime.now() + timedelta(weeks=1)).strftime("%Y-W%V")
