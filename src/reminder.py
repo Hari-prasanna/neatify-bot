@@ -94,8 +94,7 @@ def run_reminder() -> None:
     if ok:
         logger.info(f"Group reminder sent: {roomie['name']} / {week_str}")
         log_to_db("INFO",
-                  f"Friday reminder sent (group): {roomie['name']} / "
-                  f"{task['task_description']} / {week_str}")
+                  f"Friday reminder sent (group): {roomie['name']} / Entire Home / {week_str}")
     else:
         logger.error("Group reminder failed.")
         log_to_db("ERROR", "Friday reminder group send failed")
