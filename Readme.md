@@ -1,107 +1,127 @@
 # Neatify Cleaning Bot
 
 Telegram bot managing a weekly cleaning rotation for a shared house with:
-- Local polling backend (`[dev/main.py](dev/main.py)`)
-- Serverless AWS Lambda webhook (`[prod/function.py](prod/function.py)`)
-- Shared rotation engine in `[src/utils.py](src/utils.py)`
+- Local polling backend ([dev/main.py](dev/main.py))
+- Serverless AWS Lambda webhook ([prod/function.py](prod/function.py))
+- Shared rotation engine in [src/utils.py](src/utils.py)
+- Shared constants in [src/constants.py](src/constants.py)
 
-## Local development (DEV)
+## Local development
 
 ### Prerequisites
 
-- Python 3.13 installed.
-- Active Supabase project.
+- Python 3.13 installed
+- Active Supabase project
 
 ### 1) Configure environment
 
-Update `[.env](.env)` with valid values (copy from `[.env.example](.env.example)`):
+Copy [.env.example](.env.example) and fill in credentials:
 
-- `TELEGRAM_TOKEN`
-- `TELEGRAM_GROUP_ID`
-- `SUPABASE_URL`
-- `SUPABASE_KEY`
-- `ADMIN_TELEGRAM_ID`
+```bash
+cp .env.example .env
+```
+
+Required variables:
+
+| Variable | Purpose |
+|---|---|
+| `TELEGRAM_TOKEN` | Bot token from @BotFather |
+| `TELEGRAM_GROUP_ID` | Target group chat ID |
+| `SUPABASE_URL` | Supabase project URL |
+| `SUPABASE_KEY` | Supabase anon key |
+| `ADMIN_TELEGRAM_ID` | Your Telegram user ID |
 
 ### 2) Initialize database
 
-Execute `[database/schema.sql](database/schema.sql)` in your Supabase SQL Editor.
-Bootstrap the core tasks:
+Execute [database/schema.sql](database/schema.sql) in your Supabase SQL Editor, then bootstrap tasks:
 
 ```sql
 INSERT INTO dim_tasks (task_description) VALUES ('Entire Home'), ('Bathroom');
 ```
 
-### 3) Build and start services
-
-Install dependencies and run the local polling instance:
+### 3) Run the bot
 
 ```bash
 pip install -r dev/requirements.txt
 python dev/main.py
 ```
 
-### 4) Useful operations
+Stop with `Ctrl + C`.
 
-Stop local polling (clean exit):
-```bash
-Ctrl + C
-```
+---
 
-## Production Deploy (AWS)
+## Production deploy (AWS Lambda)
 
-### 1) Configure secrets
-Ensure GitHub Actions Secrets are populated:
-- `TELEGRAM_TOKEN`, `TELEGRAM_GROUP_ID`, `TELEGRAM_SECRET_TOKEN`
-- `ADMIN_TELEGRAM_ID`
-- `SUPABASE_URL`, `SUPABASE_KEY`
-- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+### 1) Configure GitHub Actions Secrets
+
+| Secret | Purpose |
+|---|---|
+| `TELEGRAM_TOKEN` | Bot token |
+| `TELEGRAM_GROUP_ID` | Target group chat ID |
+| `TELEGRAM_SECRET_TOKEN` | Webhook signature verification |
+| `ADMIN_TELEGRAM_ID` | Admin's Telegram user ID |
+| `SUPABASE_URL` | Supabase project URL |
+| `SUPABASE_KEY` | Supabase anon key |
+| `AWS_ACCESS_KEY_ID` | AWS deploy credentials |
+| `AWS_SECRET_ACCESS_KEY` | AWS deploy credentials |
 
 ### 2) Push to deploy
-Deployments are handled completely via CI/CD. Push to the target branch:
 
 ```bash
 git push origin dev
 ```
 
-This triggers `[.github/workflows/deploy.yml](.github/workflows/deploy.yml)` to:
-- Build the deployment container via AWS SAM.
-- Deploy the serverless stack (`prod/function.py`) to AWS Lambda.
-- Automatically wire the new API Gateway URL to the Telegram webhook.
+This triggers [.github/workflows/deploy.yml](.github/workflows/deploy.yml) to build and deploy via AWS SAM, then wire the new API Gateway URL to the Telegram webhook automatically.
 
-## Commands and Roles
+---
 
-- Commands are routed via Private DM to reduce group noise. The bot broadcasts to the group chat only upon task completion.
-- On first interaction, users must self-register:
-    - `POST /hi` (captures Telegram ID and @username automatically).
+## Commands
 
-- **Roommate role:**
-    - `done`: Log weekly task completion.
-    - `/next`: View upcoming global schedule and personal countdown.
-    - `/status`: View active/vacation states and last-cleaned dates.
-    - `/last`: View 3 most recent log entries.
-    - `/volunteer`: Log bonus clean and waive next scheduled turn.
-    - `/vacation` (or `/skip`): Freeze rotation placement.
-    - `/back`: Return to active rotation (grants priority pass for next turn).
+Commands are sent via **private DM** to reduce group noise. The bot broadcasts to the group only on task completion.
 
-- **Admin role:**
-    - `/activate <tg_id> <order> <task_id>`: Activate user and assign rotation slot.
-    - `/deletelast`: Remove the newest cleaning log entry.
+Register first by sending `/hi` in the group chat (captures Telegram ID and @username automatically).
+
+**Roommate commands:**
+
+| Command | Action |
+|---|---|
+| `done` | Log your clean for this week |
+| `/next` | View upcoming schedule and personal countdown |
+| `/status` | Everyone's state and last-cleaned dates |
+| `/last` | 3 most recent log entries |
+| `/volunteer` | Log a bonus clean and earn a skip pass |
+| `/vacation` | Freeze your rotation slot |
+| `/skip` | Skip your next scheduled turn |
+| `/back` | Return from vacation (grants priority pass) |
+
+**Admin commands (anywhere):**
+
+| Command | Action |
+|---|---|
+| `/activate <tg_id> <slot> <task_id>` | Activate user and assign rotation slot |
+| `/deletelast` | Remove the newest cleaning log entry |
+
+---
 
 ## Project layout
 
-- `[dev](dev)`: Local polling execution environment.
-- `[prod](prod)`: AWS Lambda webhook execution environment.
-- `[src](src)`: Core logic and shared helper modules.
-- `[src/utils.py](src/utils.py)`: Shared Supabase client, rotation engine, and structured logging.
-- `[src/reminder.py](src/reminder.py)`: Friday morning cron execution script.
-- `[database/schema.sql](database/schema.sql)`: Supabase DDL definitions.
-- `[aws-bot-iac](aws-bot-iac)`: AWS SAM infrastructure-as-code templates.
-- `[.github/workflows](.github/workflows)`: CI/CD deployment and cron pipelines.
+| Path | Purpose |
+|---|---|
+| [dev/main.py](dev/main.py) | Local polling bot |
+| [prod/function.py](prod/function.py) | AWS Lambda webhook handler |
+| [prod/template.yml](prod/template.yml) | AWS SAM infrastructure definition |
+| [src/constants.py](src/constants.py) | Task IDs, rotation limits, shared message strings |
+| [src/utils.py](src/utils.py) | Supabase client, rotation engine, shared helpers |
+| [src/reminder.py](src/reminder.py) | Friday morning reminder cron |
+| [database/schema.sql](database/schema.sql) | Supabase DDL |
+| [.github/workflows/](.github/workflows/) | CI/CD: deploy on push, reminder every Friday |
+
+---
 
 ## Notes
 
-- Keep secrets in `[.env](.env)` (do not commit).
-- Dual-track rotation (Entire Home vs. Bathroom) runs as independent queues; updating one track does not mutate the pointer of the other.
-- Data is stored in Supabase using ISO week formats (`YYYY-Www`); the presentation layer translates this to calendar weekend dates dynamically.
-- `prod/function.py` explicitly requires `HTTPXRequest` for Lambda cold-start compatibility.
-- Application failures are logged server-side directly to the `sys_logs` table in Supabase via `src/utils.py`.
+- Secrets live in `.env` locally — never commit this file.
+- The two cleaning tracks (Entire Home, Bathroom) run as fully independent queues. Completing one task does not advance the other track's cursor.
+- Weeks are stored as ISO format (`YYYY-Www`); the display layer converts to calendar weekend dates at read time.
+- `prod/function.py` requires `HTTPXRequest` for Lambda cold-start compatibility.
+- All application errors are logged to the `sys_logs` table in Supabase via `log_to_db()` in `src/utils.py`.

@@ -3,18 +3,29 @@
 
 import os
 import sys
-import json
+import asyncio
 import logging
-import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.utils import supabase, get_current_week, log_to_db, find_next_person, mention_user
+import telegram
+
+from src.constants import TASK_ENTIRE_HOME
+from src.utils import get_current_week, log_to_db, find_next_person, mention_user
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("reminder")
 
-ENTIRE_HOME_TASK_ID = 1
+_TELEGRAM_SEND_TIMEOUT: float = 10.0
+
+
+async def _send_reminder_message(token: str, group_id: int, message: str) -> None:
+    bot = telegram.Bot(token=token)
+    async with bot:
+        await bot.send_message(
+            chat_id=group_id, text=message, parse_mode="HTML",
+            read_timeout=_TELEGRAM_SEND_TIMEOUT,
+        )
 
 
 def run_reminder() -> None:
@@ -26,12 +37,12 @@ def run_reminder() -> None:
         sys.exit(1)
 
     week_str    = get_current_week()
-    next_config = find_next_person(ENTIRE_HOME_TASK_ID)
+    next_config = find_next_person(TASK_ENTIRE_HOME)
 
     if not next_config:
-        msg = f"Friday reminder skipped — no eligible person for task_id={ENTIRE_HOME_TASK_ID} in {week_str}."
-        logger.warning(msg)
-        log_to_db("WARNING", msg)
+        skipped_msg = f"Friday reminder skipped — no eligible person for task_id={TASK_ENTIRE_HOME} in {week_str}."
+        logger.warning(skipped_msg)
+        log_to_db("WARNING", skipped_msg)
         return
 
     roomie = next_config["dim_roommates"]
@@ -46,27 +57,15 @@ def run_reminder() -> None:
         f"Reply <b>done</b> in the group when finished! 🙌"
     )
 
-    telegram_url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": int(group_id), "text": message, "parse_mode": "HTML"}
-
     try:
-        data = json.dumps(payload).encode("utf-8")
-        req  = urllib.request.Request(
-            telegram_url, data=data,
-            headers={"Content-Type": "application/json"}, method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=10.0) as response:
-            if response.status == 200:
-                logger.info(f"Reminder sent: {roomie['name']} / {week_str}")
-                log_to_db("INFO",
-                          f"Friday reminder sent: {roomie['name']} / "
-                          f"{task['task_description']} / {week_str}")
-            else:
-                logger.error(f"Telegram returned status: {response.status}")
-                sys.exit(1)
-    except Exception as e:
-        logger.error(f"Failed to send reminder: {e}")
-        log_to_db("ERROR", "Friday reminder send failed", error_details=str(e))
+        asyncio.run(_send_reminder_message(token, int(group_id), message))
+        logger.info(f"Reminder sent: {roomie['name']} / {week_str}")
+        log_to_db("INFO",
+                  f"Friday reminder sent: {roomie['name']} / "
+                  f"{task['task_description']} / {week_str}")
+    except Exception as reminder_error:
+        logger.error(f"Failed to send reminder: {reminder_error}")
+        log_to_db("ERROR", "Friday reminder send failed", error_details=str(reminder_error))
         sys.exit(1)
 
 
