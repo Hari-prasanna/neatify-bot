@@ -19,9 +19,11 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     ContextTypes, filters,
 )
+from src.constants import TASK_ENTIRE_HOME, TASK_BATHROOM, GROUP_ONLY_WARN
 from src.utils import (
     supabase, BOT_ENV, get_current_week, get_weekend_dates_from_week,
-    log_to_db, log_interaction, peek_next_person_id, consume_skips_up_to,
+    log_to_db, log_interaction, is_admin, get_last_cleaned_date,
+    peek_next_person_id, consume_skips_up_to,
     peek_next_n_persons, mention_user, compute_turn_offset,
 )
 
@@ -33,25 +35,12 @@ logger = logging.getLogger(__name__)
 
 TOKEN        = os.getenv("TELEGRAM_TOKEN")
 GROUP_ID_STR = os.getenv("TELEGRAM_GROUP_ID")
-ADMIN_ID     = os.getenv("ADMIN_TELEGRAM_ID", "")
 
 if not all([TOKEN, GROUP_ID_STR]):
     logger.critical("Missing TELEGRAM_TOKEN or TELEGRAM_GROUP_ID.")
     sys.exit(1)
 
-GROUP_ID         = int(GROUP_ID_STR)
-TASK_ENTIRE_HOME = 1
-TASK_BATHROOM    = 2
-
-# Sent when a user runs a slash command inside the group instead of a private DM
-_GROUP_WARN = (
-    "📱 Please send commands to me in a <b>private message</b> to keep this chat clean.\n"
-    "Start a DM with me and send the same command there."
-)
-
-
-def is_admin(user_id: int) -> bool:
-    return bool(ADMIN_ID) and str(user_id) == ADMIN_ID
+GROUP_ID = int(GROUP_ID_STR)
 
 
 def _err(label: str, exc: Exception) -> None:
@@ -65,21 +54,6 @@ def _err(label: str, exc: Exception) -> None:
     print(f"{'─' * 60}", flush=True)
     print(tb, flush=True)
     print(f"{bar}\n", flush=True)
-
-
-def get_last_cleaned_date(roommate_id: int) -> str:
-    try:
-        res = (
-            supabase.table("fct_cleaning_logs")
-            .select("cleaned_at").eq("roommate_id", roommate_id)
-            .order("cleaned_at", desc=True).limit(1).execute()
-        )
-        if res.data:
-            raw = res.data[0]["cleaned_at"].split("T")[0]
-            return datetime.strptime(raw, "%Y-%m-%d").strftime("%d %b")
-    except Exception as e:
-        print(f"\n[get_last_cleaned_date] roommate_id={roommate_id}: {type(e).__name__}: {e}", flush=True)
-    return "Never"
 
 
 async def handle_hi(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -270,7 +244,7 @@ async def handle_done_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def handle_next(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.chat.type != "private":
-        await update.message.reply_text(_GROUP_WARN, parse_mode="HTML")
+        await update.message.reply_text(GROUP_ONLY_WARN, parse_mode="HTML")
         return
 
     user_id  = update.message.from_user.id
@@ -370,7 +344,7 @@ async def handle_next(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def get_status(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.chat.type != "private":
-        await update.message.reply_text(_GROUP_WARN, parse_mode="HTML")
+        await update.message.reply_text(GROUP_ONLY_WARN, parse_mode="HTML")
         return
 
     week_str = get_current_week()
@@ -402,7 +376,7 @@ async def get_status(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def handle_last(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.chat.type != "private":
-        await update.message.reply_text(_GROUP_WARN, parse_mode="HTML")
+        await update.message.reply_text(GROUP_ONLY_WARN, parse_mode="HTML")
         return
 
     try:
@@ -440,7 +414,7 @@ async def handle_last(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def set_vacation(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.chat.type != "private":
-        await update.message.reply_text(_GROUP_WARN, parse_mode="HTML")
+        await update.message.reply_text(GROUP_ONLY_WARN, parse_mode="HTML")
         return
 
     user_id = update.message.from_user.id
@@ -473,7 +447,7 @@ async def set_vacation(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> N
 async def handle_skip(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     # /skip is an alias for /vacation — marks you away for the next cycle
     if update.message.chat.type != "private":
-        await update.message.reply_text(_GROUP_WARN, parse_mode="HTML")
+        await update.message.reply_text(GROUP_ONLY_WARN, parse_mode="HTML")
         return
 
     user_id = update.message.from_user.id
@@ -505,7 +479,7 @@ async def handle_skip(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def set_back(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.chat.type != "private":
-        await update.message.reply_text(_GROUP_WARN, parse_mode="HTML")
+        await update.message.reply_text(GROUP_ONLY_WARN, parse_mode="HTML")
         return
 
     user_id = update.message.from_user.id
@@ -538,7 +512,7 @@ async def set_back(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def handle_volunteer(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.chat.type != "private":
-        await update.message.reply_text(_GROUP_WARN, parse_mode="HTML")
+        await update.message.reply_text(GROUP_ONLY_WARN, parse_mode="HTML")
         return
 
     user_id  = update.message.from_user.id
@@ -601,7 +575,7 @@ async def handle_volunteer(update: Update, _context: ContextTypes.DEFAULT_TYPE) 
 
 async def handle_myturn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.chat.type != "private":
-        await update.message.reply_text(_GROUP_WARN, parse_mode="HTML")
+        await update.message.reply_text(GROUP_ONLY_WARN, parse_mode="HTML")
         return
 
     user_id = update.message.from_user.id
@@ -697,7 +671,7 @@ async def handle_myturn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def handle_help(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.chat.type != "private":
-        await update.message.reply_text(_GROUP_WARN, parse_mode="HTML")
+        await update.message.reply_text(GROUP_ONLY_WARN, parse_mode="HTML")
         return
 
     user_id = update.message.from_user.id

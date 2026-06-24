@@ -19,8 +19,9 @@ logger = logging.getLogger(__name__)
 
 BOT_ENV: str = os.environ.get("BOT_ENV", "dev")
 
-_SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-_SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+_SUPABASE_URL: str = os.environ.get("SUPABASE_URL", "")
+_SUPABASE_KEY: str = os.environ.get("SUPABASE_KEY", "")
+_ADMIN_ID: str     = os.environ.get("ADMIN_TELEGRAM_ID", "")
 
 if not _SUPABASE_URL or not _SUPABASE_KEY:
     raise RuntimeError("SUPABASE_URL and SUPABASE_KEY must be set.")
@@ -89,6 +90,25 @@ def log_interaction(telegram_id: int, name: str, command: str) -> None:
         }).execute()
     except Exception as e:
         print(f"\n[log_interaction FAILED] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+
+
+def is_admin(user_id: int) -> bool:
+    return bool(_ADMIN_ID) and str(user_id) == _ADMIN_ID
+
+
+def get_last_cleaned_date(roommate_id: int) -> str:
+    try:
+        res = (
+            supabase.table("fct_cleaning_logs")
+            .select("cleaned_at").eq("roommate_id", roommate_id)
+            .order("cleaned_at", desc=True).limit(1).execute()
+        )
+        if res.data:
+            raw = res.data[0]["cleaned_at"].split("T")[0]
+            return datetime.strptime(raw, "%Y-%m-%d").strftime("%d %b")
+    except Exception as e:
+        print(f"\n[get_last_cleaned_date] roommate_id={roommate_id}: {type(e).__name__}: {e}", flush=True)
+    return "Never"
 
 
 def compute_turn_offset(caller_rid: int, caller_skip: int, next_rid: int, task_id: int) -> int:
