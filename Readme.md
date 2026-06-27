@@ -5,6 +5,7 @@ Telegram bot managing a weekly cleaning rotation for a shared house.
 - Local polling backend — [dev/main.py](dev/main.py)
 - Serverless AWS Lambda webhook — [prod/function.py](prod/function.py)
 - Shared rotation engine — [src/utils.py](src/utils.py)
+- Shared constants (task IDs, warning strings) — [src/constants.py](src/constants.py)
 
 ---
 
@@ -86,9 +87,11 @@ This triggers [.github/workflows/deploy.yml](.github/workflows/deploy.yml), whic
 
 ## Commands and Roles
 
-All commands are handled via **private DM** to keep the group chat clean. The bot broadcasts to the group only when a clean is logged.
+Most commands are handled via **private DM** to keep the group chat clean. The bot broadcasts to the group only when a clean is logged.
 
-Users must register on first use: send `/hi` (captures Telegram ID and @username automatically).
+A small set of commands work in both DM and group chat: `done`, `/hi`, `/activate`, and `/deletelast`. Everything else redirects you to a DM if used in the group.
+
+Users must register on first use: send `/hi` in the group or in a DM (captures Telegram ID and @username automatically).
 
 ### Roommate commands
 
@@ -130,6 +133,7 @@ roommate-cleaning-bot/
 │
 ├── src/
 │   ├── utils.py            ← Supabase client, rotation engine, logging helpers
+│   ├── constants.py        ← Task IDs and shared message strings
 │   ├── reminder.py         ← Friday cron reminder (GitHub Actions)
 │   └── requirements.txt    ← Used by the delivery.yml workflow
 │
@@ -152,8 +156,8 @@ roommate-cleaning-bot/
 
 - **Never commit `.env`** — all secrets must stay local or in GitHub Secrets.
 - **Dual-track rotation:** Entire Home (task 1) and Bathroom (task 2) run as fully independent queues. Logging a clean on one track does not move the cursor on the other.
-- **Volunteer mechanic:** `/volunteer` logs a bonus clean, banks a skip pass, and gives the volunteer priority so they can immediately say `done`. After their done is logged, the originally scheduled person automatically receives the next priority pass.
-- **Turn display:** `/next` shows the next 3 upcoming turns per track (read-only — checking the schedule never consumes skip passes). `/myturn` shows your exact date. Both factor in banked skips using the actual rotation length, not a fixed-5 formula.
+- **Volunteer mechanic:** `/volunteer` logs a bonus clean, banks a skip pass, and gives the volunteer priority so they can immediately say `done`. After their done is logged, the originally scheduled person automatically receives the next priority pass. Banked skips are consumed at the moment the rotation physically walks past that person — never prematurely during a broadcast or display call.
+- **Turn display:** `/next` shows the next 3 upcoming turns per track (read-only — checking the schedule never consumes skip passes). `/myturn` shows your exact date. Both factor in banked skips using the actual rotation length, and correctly offset dates when someone has already cleaned earlier in the same week.
 - **Week format:** Logs use ISO week strings (`YYYY-Www`). The bot converts these to human-readable weekend date ranges (`Sat DD Mon – Sun DD Mon`) in all messages.
 - **Lambda cold starts:** `prod/function.py` uses `HTTPXRequest` — required because Lambda has no running event loop at import time.
 - **Error logging:** All failures write to the `sys_logs` table in Supabase. In dev, errors are also printed to the terminal with a full traceback. In prod, check CloudWatch.
