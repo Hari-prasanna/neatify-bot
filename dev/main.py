@@ -3,7 +3,7 @@
 # Channel split:
 #   Private DMs  → all commands and "done" are handled here; "done" also broadcasts to GROUP_ID
 #   Group chat   → only "done" is accepted; slash commands get a redirect warning
-#   /hi, /activate, /deletelast work in both contexts
+#   /hi, /list, /activate, /remove, /deletelast work in both contexts
 
 import os
 import sys
@@ -695,7 +695,9 @@ async def handle_help(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> No
     if is_admin(user_id):
         msg += (
             "\n\n<b>🔧 Admin Tools</b>\n"
-            "• /activate [tg_id] [order] [task_id]\n"
+            "• /list — All roommates + rotation slots\n"
+            "• /activate [tg_id] [slot] [task_id] — Add/update slot\n"
+            "• /remove [id] — Deactivate + remove from rotation\n"
             "• /deletelast — Remove newest log entry"
         )
     await update.message.reply_text(msg, parse_mode="HTML")
@@ -833,6 +835,140 @@ async def handle_deletelast(update: Update, _context: ContextTypes.DEFAULT_TYPE)
         )
 
 
+async def handle_list(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Admin command — works in both group and DM
+    user_id = update.message.from_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("👥 <b>Roommate List</b>\n\n🚫 Admin only.", parse_mode="HTML")
+        return
+
+    try:
+        roommates_res = (
+            supabase.table("dim_roommates")
+            .select("roommate_id, name, is_active")
+            .order("roommate_id").execute()
+        )
+        slots_res = (
+            supabase.table("rotation_config")
+            .select("roommate_id, task_id, sequence_order").execute()
+        )
+
+        slot_map: dict[int, dict[int, int]] = {}
+        for s in slots_res.data or []:
+            slot_map.setdefault(s["roommate_id"], {})[s["task_id"]] = s["sequence_order"]
+
+        lines = []
+        for r in roommates_res.data or []:
+            rid    = r["roommate_id"]
+            icon   = "✅" if r["is_active"] else "❌"
+            status = "active" if r["is_active"] else "inactive"
+            tracks = slot_map.get(rid, {})
+            home   = f"Home:{tracks[TASK_ENTIRE_HOME]}" if TASK_ENTIRE_HOME in tracks else "Home:—"
+            bath   = f"Bath:{tracks[TASK_BATHROOM]}"   if TASK_BATHROOM   in tracks else "Bath:—"
+            lines.append(f"{icon} <b>ID {rid}</b> — {html.escape(r['name'])} ({status}) · {home} · {bath}")
+
+        taken_home = {v[TASK_ENTIRE_HOME] for v in slot_map.values() if TASK_ENTIRE_HOME in v}
+        taken_bath = {v[TASK_BATHROOM]    for v in slot_map.values() if TASK_BATHROOM    in v}
+        next_home  = max(taken_home, default=0) + 1
+        next_bath  = max(taken_bath, default=0) + 1
+
+        body = "\n".join(lines) if lines else "No roommates found."
+        msg  = (
+            f"👥 <b>Roommate List</b>\n\n{body}\n\n"
+            f"💡 Next free slot — Home: {next_home} · Bath: {next_bath}\n"
+            f"Use /remove [id] to offboard · /activate to add/update"
+        )
+        await update.message.reply_text(msg, parse_mode="HTML")
+
+    except Exception as e:
+        _err("handle_list", e)
+        log_to_db("ERROR", "handle_list failed", error_details=traceback.format_exc())
+        await update.message.reply_text(
+            "⚠️ Something went wrong — check the terminal for the full error.", parse_mode="HTML"
+        )
+
+
+async def handle_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Admin command — works in both group and DM
+    user_id = update.message.from_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("🗑️ <b>Remove Roommate</b>\n\n🚫 Admin only.", parse_mode="HTML")
+        return
+
+    if len(context.args) != 1:
+        await update.message.reply_text(
+            "🗑️ <b>Remove Roommate</b>\n\nUsage: /remove [roommate_id]\nUse /list to see IDs.",
+            parse_mode="HTML"
+        )
+        return
+
+    try:
+        target_rid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text(
+            "🗑️ <b>Remove Roommate</b>\n\n❌ ID must be an integer.", parse_mode="HTML"
+        )
+        return
+
+    try:
+        target_res = supabase.table("dim_roommates").select("*").eq("roommate_id", target_rid).execute()
+        if not target_res.data:
+            await update.message.reply_text(
+                f"🗑️ <b>Remove Roommate</b>\n\n❌ No roommate with ID {target_rid}.\nUse /list to see valid IDs.",
+                parse_mode="HTML"
+            )
+            return
+
+        target = target_res.data[0]
+        name   = html.escape(target["name"])
+
+        slots_res = (
+            supabase.table("rotation_config")
+            .select("task_id, sequence_order").eq("roommate_id", target_rid).execute()
+        )
+        slot_lines = []
+        for s in slots_res.data or []:
+            track = "Entire Home" if s["task_id"] == TASK_ENTIRE_HOME else "Bathroom"
+            slot_lines.append(f"  • {track}: slot {s['sequence_order']}")
+
+        # Soft-deactivate + clear all state flags
+        supabase.table("dim_roommates").update({
+            "is_active":              False,
+            "is_on_vacation":         False,
+            "is_priority_next":       False,
+            "skip_turn_count":        0,
+            "skip_next_turn_task_id": None,
+            "volunteer_replacing_id": None,
+        }).eq("roommate_id", target_rid).execute()
+
+        # Remove from both rotation tracks
+        supabase.table("rotation_config").delete().eq("roommate_id", target_rid).execute()
+
+        # Clear dangling volunteer_replacing_id pointers from other people
+        supabase.table("dim_roommates").update(
+            {"volunteer_replacing_id": None}
+        ).eq("volunteer_replacing_id", target_rid).execute()
+
+        log_to_db("INFO", f"Admin removed {target['name']} (roommate_id={target_rid}) from rotation")
+
+        freed = "\n".join(slot_lines) if slot_lines else "  • (no slots assigned)"
+        await update.message.reply_text(
+            f"🗑️ <b>Remove Roommate</b>\n\n"
+            f"✅ {name} removed.\n"
+            f"• Status: inactive (history preserved)\n"
+            f"• Slots freed:\n{freed}\n\n"
+            f"To re-add: have them send /hi, then use /activate.",
+            parse_mode="HTML"
+        )
+
+    except Exception as e:
+        _err(f"handle_remove (rid={target_rid})", e)
+        log_to_db("ERROR", f"handle_remove failed for rid={target_rid}", error_details=traceback.format_exc())
+        await update.message.reply_text(
+            "⚠️ Something went wrong — check the terminal for the full error.", parse_mode="HTML"
+        )
+
+
 async def _log_private_interaction(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.from_user or not update.message.text:
         return
@@ -865,7 +1001,9 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("skip",       handle_skip))
     app.add_handler(CommandHandler("back",       set_back))
     app.add_handler(CommandHandler("volunteer",  handle_volunteer))
+    app.add_handler(CommandHandler("list",       handle_list))
     app.add_handler(CommandHandler("activate",   handle_activate))
+    app.add_handler(CommandHandler("remove",     handle_remove))
     app.add_handler(CommandHandler("deletelast", handle_deletelast))
 
     logger.info(f"DEV bot running (polling) | env={BOT_ENV}")

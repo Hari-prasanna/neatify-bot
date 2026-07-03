@@ -1,4 +1,4 @@
-# Neatify Cleaning Bot
+# Neatify Bot
 
 Telegram bot managing a weekly cleaning rotation for a shared house.
 
@@ -113,7 +113,9 @@ Users must register on first use: send `/hi` in the group or in a DM (captures T
 
 | Command | What it does |
 |---|---|
-| `/activate <tg_id> <order> <task_id>` | Activate a user and assign their rotation slot |
+| `/list` | Show all roommates with IDs, active status, and rotation slots |
+| `/activate <tg_id> <slot> <task_id>` | Add a user to rotation (or update their slot) |
+| `/remove <id>` | Deactivate a user and remove them from rotation (history preserved) |
 | `/deletelast` | Remove the most recent log entry (undo a mistaken `done`) |
 
 ---
@@ -121,7 +123,7 @@ Users must register on first use: send `/hi` in the group or in a DM (captures T
 ## Project Layout
 
 ```
-roommate-cleaning-bot/
+neatify-bot/
 ├── dev/
 │   ├── main.py             ← Local polling bot — all command handlers
 │   └── requirements.txt
